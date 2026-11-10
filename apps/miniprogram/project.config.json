@@ -1,0 +1,14 @@
+{
+  "compileType": "miniprogram",
+  "miniprogramRoot": "./",
+  "projectname": "fangzhi-search",
+  "appid": "touristappid",
+  "libVersion": "3.5.0",
+  "setting": {
+    "es6": true,
+    "enhance": true,
+    "minified": true,
+    "postcss": true,
+    "urlCheck": false
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "pages": ["pages/index/index", "pages/detail/detail"],
+  "window": {
+    "navigationBarTitleText": "方志检索",
+    "navigationBarBackgroundColor": "#14161a",
+    "navigationBarTextStyle": "white",
+    "backgroundColor": "#14161a",
+    "backgroundTextStyle": "light"
+  },
+  "style": "v2",
+  "lazyCodeLoading": "requiredComponents",
+  "sitemapLocation": "sitemap.json"
+}

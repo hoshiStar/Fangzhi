@@ -1,0 +1,27 @@
+<view class="wrap">
+  <view class="searchbar">
+    <input class="q" value="{{q}}" placeholder="搜书名、地名、志种、著者…" placeholder-class="ph"
+           confirm-type="search" bindinput="onInput" />
+    <view class="x" bindtap="onClear">✕</view>
+  </view>
+
+  <scroll-view class="facets" scroll-x enable-flex>
+    <view class="chip {{selProvinces.indexOf(p.v) >= 0 ? 'on' : ''}}" wx:for="{{provinces}}" wx:key="v"
+          wx:for-item="p" data-kind="province" data-v="{{p.v}}" bindtap="toggleFacet">{{p.v}}<b>{{p.c}}</b></view>
+    <view class="gap"></view>
+    <view class="chip {{selEras.indexOf(p.v) >= 0 ? 'on' : ''}}" wx:for="{{eras}}" wx:key="v"
+          wx:for-item="p" data-kind="era" data-v="{{p.v}}" bindtap="toggleFacet">{{p.v}}<b>{{p.c}}</b></view>
+  </scroll-view>
+
+  <view class="summary">{{summary}}</view>
+
+  <view class="book {{item.fuzzy ? 'fuzzy' : ''}}" wx:for="{{books}}" wx:key="id"
+        data-id="{{item.id}}" bindtap="openDetail">
+    <view class="t">{{item.title}}</view>
+    <view class="m">{{item.meta}}</view>
+  </view>
+
+  <view class="more" wx:if="{{hasMore}}" bindtap="loadMore">再加载 50 部</view>
+  <view class="more dim" wx:elif="{{books.length}}">到底了</view>
+  <view class="more dim" wx:else>没有匹配的书。试试只输地名（如「莆田」）。</view>
+</view>

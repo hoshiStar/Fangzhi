@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; worker-src 'self' blob:; connect-src 'self' fzpdf:; style-src 'self'; img-src 'self' data: blob:; font-src 'self' data:;" />
+  <title>方志检索</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo">志</span>
+      <div>
+        <h1>方志检索</h1>
+        <p id="subtitle" class="sub">载入中…</p>
+      </div>
+    </div>
+    <div class="searchbox">
+      <input id="q" type="search" placeholder="搜书名、地名、志种、著者…（多词用空格隔开，全部命中才排前面）" autocomplete="off" spellcheck="false" />
+      <button id="clear" class="ghost" title="清空">✕</button>
+    </div>
+    <div class="topbtns">
+      <button id="btn-cookie" class="ghost">账号</button>
+      <button id="btn-dl" class="ghost">下载<span id="dl-badge" class="badge hidden"></span></button>
+      <button id="btn-crawl" class="ghost">更新索引</button>
+      <button id="btn-dir" class="ghost">数据目录</button>
+    </div>
+  </header>
+
+  <div id="crawlbar" class="crawlbar hidden"></div>
+
+  <div id="modal" class="modal hidden"><div class="card" id="modal-card"></div></div>
+  <div id="dltray" class="dltray hidden"></div>
+
+  <main>
+    <aside class="facets" id="facets">
+      <button id="btn-facets" class="facet-toggle" title="收起 / 展开筛选栏">
+        <span class="ft-label">筛选</span><span class="ft-arrow">‹</span>
+      </button>
+      <div class="facet-body">
+        <section data-facet="province"><h2>省区</h2><div class="chips"></div></section>
+        <section data-facet="era"><h2>朝代</h2><div class="chips"></div></section>
+        <section data-facet="zhiType"><h2>志种</h2><div class="chips"></div></section>
+        <section data-facet="ext"><h2>格式</h2><div class="chips"></div></section>
+        <button id="btn-reset" class="ghost wide hidden">清除筛选</button>
+      </div>
+    </aside>
+
+    <section class="results">
+      <div id="summary" class="summary"></div>
+      <div id="textlist" class="textlist hidden"></div>
+      <div id="list" class="list"></div>
+      <div id="pager" class="pager"></div>
+    </section>
+
+    <section id="detail" class="detail hidden"></section>
+  </main>
+
+  <footer class="status">
+    <span id="status-left"></span>
+    <span id="status-right"></span>
+  </footer>
+
+  <div id="reader" class="reader hidden">
+    <div class="rbar">
+      <span id="r-title" class="rtitle"></span>
+      <span id="r-mode" class="tag"></span>
+      <span class="rgrow"></span>
+      <button id="r-prev" title="上一页（←）">‹ 上一页</button>
+      <input id="r-page" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" />
+      <span id="r-total" class="tag">/ 0</span>
+      <button id="r-next" title="下一页（→）">下一页 ›</button>
+      <input id="r-q" class="rq hidden" placeholder="书内搜索，回车下一处" />
+      <span id="r-hits" class="tag hidden"></span>
+      <button id="r-pdf" class="on" title="看原 PDF 版面">PDF 原文</button>
+      <button id="r-ocr" title="看 OCR 识别出的文字（还没识别时不可用）" disabled>OCR 文本</button>
+      <button id="r-fit" title="在「适应宽度」和「实际大小」之间切换">适应宽度</button>
+      <button id="r-close" title="关闭（Esc）">✕</button>
+    </div>
+    <div id="r-stage" class="rstage">
+      <canvas id="r-canvas"></canvas>
+      <div id="r-text" class="rtext hidden"></div>
+      <div id="r-msg" class="rmsg hidden"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

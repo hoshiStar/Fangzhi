@@ -1,0 +1,23 @@
+<view class="wrap" wx:if="{{book}}">
+  <view class="title">{{book.displayTitle || book.title}}</view>
+  <view class="meta">
+    <view wx:if="{{book.era}}">朝代 <text class="b">{{book.era}}</text></view>
+    <view wx:if="{{book.place}}">地名 <text class="b">{{book.place}}</text></view>
+    <view wx:if="{{book.zhiType}}">志种 <text class="b">{{book.zhiType}}</text></view>
+    <view wx:if="{{book.province}}">省区 <text class="b">{{book.province}}</text></view>
+    <view wx:if="{{book.author}}">著录 <text class="b">{{book.author}}</text></view>
+    <view wx:if="{{book.edition}}">版本 <text class="b">{{book.edition}}</text></view>
+    <view>置信度 <text class="b">{{book.confidence}}</text> · {{book.fileCount}} 册</view>
+  </view>
+
+  <button class="primary" bindtap="copyLink">复制夸克分享链接</button>
+  <view class="hint">小程序不能直连网盘下载。复制链接到浏览器打开分享页，或复制单个文件名去夸克里找。</view>
+
+  <view class="h3">文件</view>
+  <view class="file" wx:for="{{files}}" wx:key="index" data-name="{{item.name}}" bindtap="copyName">
+    <text class="s">{{item.sizeText}}</text>{{item.name}}
+    <text class="tag" wx:if="{{item.volume}}">{{item.volume}}</text>
+    <text class="tag" wx:if="{{item.section}}">{{item.section}}</text>
+  </view>
+</view>
+<view class="empty" wx:else>找不到这本书</view>

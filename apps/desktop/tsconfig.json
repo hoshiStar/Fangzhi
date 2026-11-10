@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "paths": {
+      "@fangzhi/core": ["../../packages/core/src/index.ts"],
+      "@fangzhi/core/crawl": ["../../packages/core/src/crawl.ts"],
+      "@fangzhi/core/download": ["../../packages/core/src/download.ts"]
+    }
+  },
+  "include": ["src"]
+}

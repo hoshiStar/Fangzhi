@@ -1,0 +1,17 @@
+page {
+  background: #14161a;
+  color: #e6e8ec;
+  font: 14px/1.6 -apple-system, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+}
+.chip {
+  display: inline-block;
+  margin: 0 6px 6px 0;
+  padding: 2px 9px;
+  border-radius: 11px;
+  background: #22262e;
+  border: 1px solid #2c313a;
+  color: #9aa2af;
+  font-size: 12px;
+}
+.chip.on { background: rgba(216, 162, 74, 0.14); border-color: #d8a24a; color: #d8a24a; }
+.chip b { margin-left: 4px; font-weight: 400; opacity: 0.7; }

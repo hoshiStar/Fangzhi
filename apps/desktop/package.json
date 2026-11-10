@@ -1,0 +1,21 @@
+{
+  "name": "@fangzhi/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main/index.cjs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs && electron .",
+    "start": "electron .",
+    "package": "node scripts/build.mjs && node scripts/package-portable.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "electron": "44.3.0",
+    "esbuild": "^0.25.0",
+    "pdfjs-dist": "^6.5.438"
+  },
+  "dependencies": {
+    "opencc-js": "^1.4.2"
+  }
+}

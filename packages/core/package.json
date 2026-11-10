@@ -1,0 +1,13 @@
+{
+  "name": "@fangzhi/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./crawl": "./src/crawl.ts",
+    "./download": "./src/download.ts"
+  },
+  "description": "夸克网盘地方志分享库的爬取、元数据解析与检索核心。纯函数，Electron 与小程序共用。"
+}

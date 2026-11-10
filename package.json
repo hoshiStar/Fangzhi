@@ -1,0 +1,21 @@
+{
+  "name": "fangzhi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "crawl": "node packages/core/src/cli.ts crawl",
+    "build-index": "node packages/core/src/cli.ts build-index",
+    "stats": "node packages/core/src/cli.ts stats",
+    "search": "node packages/core/src/cli.ts search",
+    "typecheck": "tsc -p packages/core/tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^24.0.0"
+  }
+}

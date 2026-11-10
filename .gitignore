@@ -1,0 +1,10 @@
+node_modules/
+release/
+dist/
+data/
+tools/ocr/models/
+__pycache__/
+*.pyc
+*.log
+.tmp/
+.DS_Store
