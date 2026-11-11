@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve, sep } from 'node:path';
 import { Converter } from 'opencc-js';
 
 export interface OcrLine {
@@ -106,6 +106,107 @@ export function loadTextFile(file: string): LoadedText {
   return parseTextFile(readFileSync(file, 'utf8'));
 }
 
+/* ---------- 持久化文本缓存 ---------- */
+
+/**
+ * OCR 的 jsonl 每页都带 lines（每个字的坐标框），比正文大一倍以上；再叠上 opencc
+ * 逐页归一化，全库首次检索就得啃上千个文件。这里把「检索真正要用的两样东西」——
+ * 原文和归一化文本——单独落一份紧凑缓存，键是源文件 mtime，重跑识别自动失效。
+ *
+ * 格式刻意不用 JSON：一行一页，字段用 \t 分隔，正文里的换行/制表符用控制字符占位，
+ * 解析成本比 JSON.parse 一个带坐标数组的对象低一个量级。
+ */
+const CACHE_MAGIC = 'FZTC1';
+const NL = '\u0001';
+const TAB = '\u0002';
+
+function escapeCell(s: string): string {
+  return s.replace(/\n/g, NL).replace(/\t/g, TAB);
+}
+function unescapeCell(s: string): string {
+  return s.replace(new RegExp(NL, 'g'), '\n').replace(new RegExp(TAB, 'g'), '\t');
+}
+
+/** 缓存放数据目录下的隐藏子目录，跟着索引走；fid 只保留安全字符当文件名。 */
+export function textCachePath(dataDir: string, fid: string): string {
+  return join(dataDir, '.text-cache', `${fid.replace(/[^\w-]/g, '_').slice(0, 100)}.txt`);
+}
+
+export function serializeTextCache(loaded: LoadedText, mtimeMs: number): string {
+  const rows: string[] = [`${CACHE_MAGIC}\t${mtimeMs}\t${loaded.pages.size}`];
+  for (const p of [...loaded.pages.keys()].sort((a, b) => a - b)) {
+    const page = loaded.pages.get(p)!;
+    const np = loaded.norm.get(p);
+    const text = page.text;
+    const n = np?.n ?? text;
+    rows.push([
+      p,
+      np?.aligned ? 1 : 0,
+      escapeCell(text),
+      // 归一化后和原文一字不差（本来就是简体）时不重复存
+      n === text ? '' : escapeCell(n),
+    ].join('\t'));
+  }
+  return rows.join('\n') + '\n';
+}
+
+/** mtime 对不上（OCR 重跑过）就当没有缓存。 */
+export function parseTextCache(content: string, mtimeMs: number): LoadedText | null {
+  const lines = content.split('\n');
+  const head = lines[0]?.split('\t') ?? [];
+  if (head[0] !== CACHE_MAGIC || Number(head[1]) !== mtimeMs) return null;
+
+  const pages = new Map<number, OcrPage>();
+  const norm = new Map<number, { n: string; aligned: boolean }>();
+  for (let i = 1; i < lines.length; i++) {
+    const raw = lines[i];
+    if (!raw) continue;
+    const cell = raw.split('\t');
+    if (cell.length < 3) continue;
+    const p = Number(cell[0]);
+    if (!Number.isInteger(p)) continue;
+    const aligned = cell[1] === '1';
+    const text = unescapeCell(cell[2] ?? '');
+    const n = cell[3] ? unescapeCell(cell[3]) : text;
+    pages.set(p, { p, dpi: 0, w: 0, h: 0, text, lines: [] });
+    norm.set(p, { n, aligned });
+  }
+  if (!pages.size) return null;
+  return { pages, norm };
+}
+
+/**
+ * 取一份可直接检索的文本：优先读缓存，没缓存（或已过期）才解析 jsonl 并回写。
+ * 写缓存是尽力而为——打包版的数据目录可能是只读的，失败不能影响检索。
+ */
+export function loadTextFast(file: string, cacheFile: string): { loaded: LoadedText; fromCache: boolean } | null {
+  const mtimeMs = textFileMtime(file);
+  if (mtimeMs < 0) return null;
+
+  try {
+    const cached = parseTextCache(readFileSync(cacheFile, 'utf8'), mtimeMs);
+    if (cached) return { loaded: cached, fromCache: true };
+  } catch {
+    // 没有缓存文件是常态
+  }
+
+  let loaded: LoadedText;
+  try {
+    loaded = loadTextFile(file);
+  } catch {
+    return null;
+  }
+  try {
+    mkdirSync(dirname(cacheFile), { recursive: true });
+    const tmp = `${cacheFile}.${process.pid}.tmp`;
+    writeFileSync(tmp, serializeTextCache(loaded, mtimeMs));
+    renameSync(tmp, cacheFile);
+  } catch {
+    // 只读目录或磁盘满：下次还是要重新解析，但不影响本次结果
+  }
+  return { loaded, fromCache: false };
+}
+
 export function countIn(hay: string, needle: string): number {
   let n = 0;
   for (let at = hay.indexOf(needle); at !== -1; at = hay.indexOf(needle, at + needle.length)) n++;
@@ -193,16 +294,13 @@ export function scanAllSync(
   for (const task of tasks) {
     const file = resolveTextPath(dataDir, task.textRef);
     if (!file) continue;
-    let loaded: LoadedText;
-    try {
-      loaded = loadTextFile(file);
-    } catch {
-      continue;
-    }
-    const { hits, count } = scanLoaded(loaded, needle);
+    // 兜底路径同样吃磁盘缓存：至少别让界面在同步扫描时重复做 opencc
+    const r = loadTextFast(file, textCachePath(dataDir, task.fid));
+    if (!r) continue;
+    const { hits, count } = scanLoaded(r.loaded, needle);
     if (!count) continue;
     total += count;
-    mergeFileHit(books, task, loaded, hits, count, needle);
+    mergeFileHit(books, task, r.loaded, hits, count, needle);
   }
   return { total, books: finalizeBooks(books, limit) };
 }

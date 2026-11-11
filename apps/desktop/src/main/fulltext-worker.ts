@@ -1,7 +1,7 @@
 import { parentPort } from 'node:worker_threads';
 import {
-  finalizeBooks, loadTextFile, mergeFileHit, normalizeText, resolveTextPath,
-  scanLoaded, textFileMtime,
+  finalizeBooks, loadTextFast, mergeFileHit, normalizeText, resolveTextPath,
+  scanLoaded, textCachePath, textFileMtime,
 } from './fulltext-core.ts';
 import type { LoadedText, TextBookHit, TextFileTask } from './fulltext-core.ts';
 
@@ -11,8 +11,10 @@ import type { LoadedText, TextBookHit, TextFileTask } from './fulltext-core.ts';
  * 为什么要单开线程：一本志的 OCR 文本动辄几十万字，全库扫一遍要读上千个 jsonl、
  * 每页还要做一次繁简归一化了。放在主进程里同步跑，搜索框会整体卡住，连输入都掉帧。
  *
- * 缓存按 (路径, mtime) 失效，OCR 重跑过的文件自动重新读。缓存有上限：上千本全塞进来
- * 是几百兆内存，命中率换不来这个代价。
+ * 两级缓存：
+ * - 内存：按 (路径, mtime) 失效，上限 400 个文件——上千本全塞进来是几百兆，不划算；
+ * - 磁盘：`data/.text-cache/*.txt`，只存原文和归一化文本，省掉 jsonl 里的坐标数组和
+ *   opencc 换算，进程重启后第一次检索也是走缓存。
  */
 
 const MAX_CACHED_FILES = 400;
@@ -30,7 +32,7 @@ const canceled = new Set<number>();
 const queue: Job[] = [];
 let running = false;
 
-function takeFromCache(file: string): LoadedText | null {
+function takeFromCache(file: string, cacheFile: string, stats: { cached: number; parsed: number }): LoadedText | null {
   const mtimeMs = textFileMtime(file);
   if (mtimeMs < 0) return null;
   const hit = cache.get(file);
@@ -40,20 +42,18 @@ function takeFromCache(file: string): LoadedText | null {
     cache.set(file, hit);
     return hit.loaded;
   }
-  let loaded: LoadedText;
-  try {
-    loaded = loadTextFile(file);
-  } catch {
-    return null;
-  }
+  const r = loadTextFast(file, cacheFile);
+  if (!r) return null;
+  if (r.fromCache) stats.cached++;
+  else stats.parsed++;
   cache.delete(file);
-  cache.set(file, { mtimeMs, loaded });
+  cache.set(file, { mtimeMs, loaded: r.loaded });
   while (cache.size > MAX_CACHED_FILES) {
     const oldest = cache.keys().next();
     if (oldest.done) break;
     cache.delete(oldest.value);
   }
-  return loaded;
+  return r.loaded;
 }
 
 const yieldToMessages = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
@@ -71,6 +71,8 @@ async function runJob(job: Job): Promise<void> {
   const step = Math.max(1, Math.ceil(job.files.length / 40));
   // 每 8 个文件让出一次事件循环：取消消息才进得来，进度也不会几秒才跳一下
   const yieldEvery = 8;
+  // 这一轮有多少文件读的是磁盘缓存、多少重新解析过，供诊断脚本核对缓存是否生效
+  const stats = { cached: 0, parsed: 0 };
   for (let i = 0; i < job.files.length; i++) {
     if (canceled.has(job.id)) {
       canceled.delete(job.id);
@@ -79,7 +81,7 @@ async function runJob(job: Job): Promise<void> {
     }
     const task = job.files[i]!;
     const file = resolveTextPath(job.dataDir, task.textRef);
-    const loaded = file ? takeFromCache(file) : null;
+    const loaded = file ? takeFromCache(file, textCachePath(job.dataDir, task.fid), stats) : null;
     if (loaded) {
       const { hits, count } = scanLoaded(loaded, needle);
       if (count) {
@@ -94,7 +96,12 @@ async function runJob(job: Job): Promise<void> {
     if (i % yieldEvery === 0 || last) await yieldToMessages();
   }
 
-  parentPort?.postMessage({ type: 'done', id: job.id, result: { total, books: finalizeBooks(books, job.limit) } });
+  parentPort?.postMessage({
+    type: 'done',
+    id: job.id,
+    result: { total, books: finalizeBooks(books, job.limit) },
+    stats,
+  });
 }
 
 async function pump(): Promise<void> {

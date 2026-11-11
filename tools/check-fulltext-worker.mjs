@@ -51,7 +51,28 @@ console.log('cancel result', JSON.stringify(r2), 'elapsed', Date.now() - t0, 'ms
 w.postMessage({ type: 'search', job: { id: 3, q: '   ', limit: 20, dataDir: root, files } });
 await wait(3);
 console.log('empty query', JSON.stringify(results[2].result));
+console.log('first run stats', JSON.stringify(r1.stats));
 
 await w.terminate();
+
+// 4. 换一个 worker（模拟重启程序）：应当全部命中磁盘缓存，不再解析 jsonl
+const w2 = new Worker(resolve('apps/desktop/dist/main/fulltext-worker.cjs'));
+const results2 = [];
+w2.on('message', (m) => { if (m.type === 'done' || m.type === 'error') results2.push(m); });
+w2.on('error', (e) => { console.error('worker2 error', e); process.exit(1); });
+w2.postMessage({ type: 'search', job: { id: 9, q: '赣州府志', limit: 20, dataDir: root, files } });
+await new Promise((res, rej) => {
+  const t = setInterval(() => { if (results2.length) { clearInterval(t); res(); } }, 10);
+  setTimeout(() => { clearInterval(t); rej(new Error('worker2 timeout')); }, 8000);
+});
+const r3 = results2[0];
+if (r3.type !== 'done') throw new Error('second worker failed: ' + JSON.stringify(r3));
+console.log('second run stats', JSON.stringify(r3.stats), 'total', r3.result.total);
+if (r3.stats.cached !== files.length || r3.stats.parsed !== 0) {
+  throw new Error('重启后应全部走磁盘缓存: ' + JSON.stringify(r3.stats));
+}
+if (r3.result.total !== r1.result.total) throw new Error('缓存前后结果不一致');
+await w2.terminate();
+
 rmSync(root, { recursive: true, force: true });
 console.log('WORKER OK');

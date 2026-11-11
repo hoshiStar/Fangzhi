@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  finalizeBooks, loadTextFile, mergeFileHit, parseTextFile, resolveTextPath,
-  scanAllSync, scanLoaded, normalizeText,
+  finalizeBooks, loadTextFast, loadTextFile, mergeFileHit, parseTextCache, parseTextFile,
+  resolveTextPath, scanAllSync, scanLoaded, normalizeText, serializeTextCache, textCachePath,
 } from '../apps/desktop/src/main/fulltext-core.ts';
 import type { TextBookHit, TextFileTask } from '../apps/desktop/src/main/fulltext-core.ts';
 
@@ -139,4 +139,50 @@ test('同一本书多文件合并到一条书目记录', () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('磁盘文本缓存：往返一致，mtime 变了就失效', () => {
+  const root = makeDataDir();
+  try {
+    const file = join(root, 'ocr', 'f-a1.jsonl');
+    const cacheFile = textCachePath(root, 'f-a1');
+
+    const first = loadTextFast(file, cacheFile);
+    assert.ok(first);
+    assert.equal(first.fromCache, false, '第一次应该解析 jsonl');
+    assert.ok(existsSync(cacheFile), '解析后应写出缓存');
+
+    const second = loadTextFast(file, cacheFile);
+    assert.ok(second);
+    assert.equal(second.fromCache, true, '第二次应命中缓存');
+    // 缓存里没有坐标，但检索要用的两样东西必须一致
+    assert.equal(second.loaded.pages.get(1)?.text, first.loaded.pages.get(1)?.text);
+    assert.equal(second.loaded.norm.get(1)?.n, first.loaded.norm.get(1)?.n);
+    assert.equal(second.loaded.norm.get(1)?.aligned, first.loaded.norm.get(1)?.aligned);
+    assert.deepEqual(
+      scanLoaded(second.loaded, normalizeText('赣州府志')),
+      scanLoaded(first.loaded, normalizeText('赣州府志')),
+    );
+
+    // 假装 OCR 重跑过：缓存头里的 mtime 对不上就必须重新解析
+    const stale = serializeTextCache(first.loaded, 1);
+    assert.equal(parseTextCache(stale, 2), null);
+    assert.ok(parseTextCache(stale, 1));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('缓存吸收正文里的换行和制表符', () => {
+  const loaded = parseTextFile([
+    JSON.stringify({ p: 1, dpi: 200, w: 10, h: 10, text: '第一行\t带制表\n第二行', lines: [] }),
+  ].join('\n'));
+  const round = parseTextCache(serializeTextCache(loaded, 123), 123);
+  assert.equal(round?.pages.get(1)?.text, '第一行\t带制表\n第二行');
+});
+
+test('缓存文件路径按 fid 收敛到安全文件名', () => {
+  const p = textCachePath('D:/data', '../evil/../f-x1');
+  assert.ok(!p.includes('..'), `不应出现上级路径：${p}`);
+  assert.ok(p.includes('.text-cache'));
 });
