@@ -3,7 +3,14 @@ import { cpSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 
-rmSync('dist', { recursive: true, force: true });
+// 默认不清空 dist：esbuild 的输出文件名是固定的，覆盖写就够了。
+// 整目录 rm 有两个坏处——每次构建白删 200 多个文件（本机杀软逐个扫描很慢），
+// 而且删除量一大就会被环境的批量删除守卫当成批量删除拦下，本地打包因此中断过。
+// 确实要从零重建时加 --clean。
+if (process.argv.includes('--clean')) {
+  rmSync('dist', { recursive: true, force: true });
+  console.log('已清空 dist/');
+}
 
 const shared = {
   bundle: true,

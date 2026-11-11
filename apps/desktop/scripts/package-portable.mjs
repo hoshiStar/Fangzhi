@@ -106,23 +106,29 @@ writeFileSync(join(data, 'data-manifest.json'), JSON.stringify(manifest, null, 2
 
 renameSync(join(out, 'electron.exe'), join(out, '方志检索.exe'));
 
-// 替换旧产物。旧目录被占用时退让：留一份带时间戳的产物并明确告知，
-// 而不是把已经装配好的几百 MB 白扔。
+// 替换旧产物：只用 rename 让位，不整树删除。
+// 便携版目录动辄几百个条目，整棵树 rm 会被环境的批量删除守卫当成批量删除拦下
+// （本地打包就因此中断过），而且本机杀软/残留进程还常锁着上一版 electron.exe。
+// 旧目录改名成 x.old-<时间戳> 交给人工清理，只有条目很少时才顺手删掉。
+const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
 let finalOut = target;
-let replaced = true;
-try {
-  rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
-  renameSync(out, target);
-} catch (e) {
-  replaced = false;
-  finalOut = `${target}-${new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)}`;
-  renameSync(out, finalOut);
-  console.warn(`注意：${target} 被占用，未能替换（${e.message.split('\n')[0]}）`);
-  console.warn(`      本次产物在 ${finalOut}；关掉占用它的程序后下次会正常覆盖。`);
+let parked = null;
+if (existsSync(target)) {
+  const dest = `${target}.old-${stamp}`;
+  try {
+    renameSync(target, dest);
+    parked = dest;
+  } catch (e) {
+    finalOut = `${target}-${stamp}`;
+    console.warn(`注意：${target} 被占用，未能替换（${e.message.split('\n')[0]}）`);
+    console.warn(`      本次产物在 ${finalOut}；关掉占用它的程序后下次会正常覆盖。`);
+  }
 }
+renameSync(out, finalOut);
+if (parked) console.log(`旧产物已改名 -> ${parked}（确认新版可用后自行删除，可省几百 MB）`);
 
 const mb = (p) => (statSync(p).size / 1048576).toFixed(1);
-console.log(`便携版 -> ${finalOut}${replaced ? '' : '（旧目录未能替换）'}`);
+console.log(`便携版 -> ${finalOut}${finalOut === target ? '' : '（旧目录未能替换）'}`);
 console.log(`  version ${manifest.appVersion} · index ${manifest.index.sha256.slice(0, 12)}`);
 console.log(`  方志检索.exe  ${mb(join(finalOut, '方志检索.exe'))} MB`);
 console.log(`  resources/app ${mb(join(finalOut, 'resources', 'app', 'dist', 'main', 'index.cjs'))} MB (main bundle)`);

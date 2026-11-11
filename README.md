@@ -121,7 +121,9 @@ FZ_USER_DATA_DIR=.tmp/cdp-profile npx electron apps/desktop --remote-debugging-p
 2. 复制当前 `data/index.full.json`、`meta.json` 和全部 OCR 数据；
 3. 生成 `resources/data/data-manifest.json`，包含应用版本、索引哈希、OCR 文件数和统计信息；
 4. 把 `data/.text-index/` 一起拷进包（打包版数据目录通常不可写，运行时无法自建）；
-5. 生成 `release/portable-win-x64/方志检索.exe`。装配先写临时目录再整体替换；若旧目录正被杀软或残留进程占用，会退让成 `portable-win-x64-<时间戳>/` 并打印提示，关掉占用者后下次正常覆盖。
+5. 生成 `release/portable-win-x64/方志检索.exe`。装配先写临时目录，再整体换上去；换的时候只用改名让位、不整树删除——便携版目录动辄几百个条目，整棵树 `rm` 会被环境的批量删除守卫当成批量删除拦下，本机杀软也常锁着上一版 `electron.exe`。因此旧目录会改名成 `portable-win-x64.old-<时间戳>/`，确认新版可用后自行删除即可腾出几百 MB；只有改名都失败（旧目录被占用）时才退让成 `portable-win-x64-<时间戳>/` 并打印提示。
+
+构建脚本默认**不清空** `dist/`（esbuild 输出文件名固定，覆盖写即可，也避开整目录删除）；确实要从零重建时用 `node apps/desktop/scripts/build.mjs --clean`。
 
 发布前应执行 `npm run verify`，并核对数据清单中的 OCR 引用数与实际文件数。
 
