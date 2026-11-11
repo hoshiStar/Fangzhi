@@ -88,6 +88,21 @@ def local_name(name: str) -> str:
     return SANITIZE.sub('_', name).strip() or 'download'
 
 
+def local_pdf_path(download_dir: Path, rec: dict) -> Path | None:
+    """在下载目录里找这本书的 PDF。
+
+    桌面端现在的落盘结构是 books/<bookId>/<fid>/<文件名>，同名文件不会互相覆盖；
+    早期版本直接铺在下载目录根下，继续兼容只读查找。
+    """
+    nested = download_dir / 'books' / str(rec.get('bookId') or '') / str(rec.get('fid') or '') / local_name(rec['name'])
+    if rec.get('bookId') and rec.get('fid') and nested.is_file():
+        return nested
+    flat = download_dir / local_name(rec['name'])
+    if flat.is_file():
+        return flat
+    return None
+
+
 def page_image(page: fitz.Page, dpi: int) -> np.ndarray:
     pix = page.get_pixmap(dpi=dpi)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -447,6 +462,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--index', default=str(REPO / 'data' / 'index.full.json'))
     ap.add_argument('--dir', help='桌面端下载保存目录，批量识别其中的本地 PDF')
+    ap.add_argument('--fids', help='只识别这些 fid（逗号分隔），配合 --dir 用；桌面端「识别本书」走这里')
     ap.add_argument('--pdf', help='只识别这一个 PDF（按文件名对上索引里的记录）')
     ap.add_argument('--fid', help='配合 --pdf 用，手动指定 fid（同名文件才需要）')
     ap.add_argument('--limit', type=int, default=20, help='批量模式下最多识别几本')
@@ -483,15 +499,18 @@ def main() -> int:
         todo.append((rec, p))
     if args.dir:
         dl = Path(args.dir)
+        only = {s.strip() for s in (args.fids or '').split(',') if s.strip()}
         for f in idx['files']:
             if len(todo) >= args.limit:
                 break
             if f.get('ext') != 'pdf':
                 continue
+            if only and f.get('fid') not in only:
+                continue
             if not args.force and f.get('ocrStatus') == 'done':
                 continue
-            p = dl / local_name(f['name'])
-            if p.is_file() and all(t[0]['fid'] != f['fid'] for t in todo):
+            p = local_pdf_path(dl, f)
+            if p and all(t[0]['fid'] != f['fid'] for t in todo):
                 todo.append((f, p))
 
     if not todo:

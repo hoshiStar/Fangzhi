@@ -40,6 +40,17 @@ declare global {
       }>;
       ocrSummary(): Promise<{ totalFiles: number; textFiles: number; doneFiles: number; doneBooks: number; totalBooks: number }>;
       openOcrFolder(): Promise<{ ok: boolean; dir?: string; error?: string }>;
+      ocrRunnerStatus(): Promise<{ job: OcrJobState; runtime: { runtime: string; label: string; note: string } }>;
+      ocrRunnerStart(opts: { limit?: number; maxPages?: number; force?: boolean; fids?: string[] }): Promise<{ ok: boolean; error?: string }>;
+      ocrRunnerCancel(): Promise<{ ok: boolean; error?: string }>;
+      onOcrProgress(cb: (p: OcrJobState) => void): () => void;
+      onOcrDone(cb: (p: { ok: boolean; note?: string }) => void): () => void;
+      marksList(): Promise<LibraryFile>;
+      markToggle(fid: string, page: number): Promise<{ ok: boolean; added: boolean; marks: BookmarkRecord[] }>;
+      markRemove(id: string): Promise<BookmarkRecord[]>;
+      recentTouch(fid: string, page: number): Promise<RecentRecord[]>;
+      recentList(): Promise<RecentRecord[]>;
+      recentClear(): Promise<RecentRecord[]>;
       onCrawlProgress(cb: (p: { dirsDone: number; dirsPending: number; files: number; reqCount: number; currentPath: string }) => void): () => void;
       onDlProgress(cb: (p: DlState) => void): () => void;
     };
@@ -54,6 +65,48 @@ interface DlState {
   status: 'queued' | 'linking' | 'downloading' | 'done' | 'error' | 'canceled';
   error?: string;
   dest?: string;
+}
+
+/** 和 main/ocr-runner.ts 的 OcrJobState 对应。 */
+interface OcrJobState {
+  status: 'idle' | 'running' | 'done' | 'error' | 'canceled';
+  runtime: string;
+  fileIndex: number;
+  fileTotal: number;
+  currentName: string;
+  page: number;
+  pageTotal: number;
+  doneFiles: number;
+  startedAt?: number;
+  finishedAt?: number;
+  error?: string;
+  log: string[];
+}
+
+/** 和 main/library.ts 对应。 */
+interface BookmarkRecord {
+  id: string;
+  fid: string;
+  bookId: string;
+  title: string;
+  fileName: string;
+  page: number;
+  createdAt: string;
+}
+
+interface RecentRecord {
+  fid: string;
+  bookId: string;
+  title: string;
+  fileName: string;
+  page: number;
+  at: string;
+}
+
+interface LibraryFile {
+  version: 1;
+  marks: BookmarkRecord[];
+  recent: RecentRecord[];
 }
 
 const PAGE = 50;
@@ -228,6 +281,7 @@ async function selectBook(id: string): Promise<void> {
     <div class="acts">
       <button id="d-share" class="primary">在夸克打开分享页</button>
       <button id="d-dl">下载本书</button>
+      <button id="d-ocr" class="ghost" disabled title="只识别已下载到本地的 PDF">识别本书</button>
       <button id="d-edit" class="ghost">校正书目</button>
     </div>
     <h3>文件</h3>
@@ -254,6 +308,18 @@ async function selectBook(id: string): Promise<void> {
   }
   const editBtn = panel.querySelector<HTMLButtonElement>('#d-edit');
   if (editBtn) editBtn.onclick = () => overrideModal(b, d.override);
+  const ocrBtn = panel.querySelector<HTMLButtonElement>('#d-ocr');
+  void window.fz.dlLocal(d.files.map((f) => f.fid)).then((local) => {
+    if (state.selected !== id || !ocrBtn) return;
+    // 只有 PDF 能识别；分卷文件本身不是完整文档，跳过。
+    const localPdf = d.files
+      .filter((f) => f.ext === 'pdf' && !f.isArchivePart && local.includes(f.fid))
+      .map((f) => f.fid);
+    if (!localPdf.length) return;
+    ocrBtn.disabled = false;
+    ocrBtn.title = `识别这本书在本地的 ${localPdf.length} 个 PDF`;
+    ocrBtn.onclick = () => void ocrBook(localPdf);
+  });
   panel.querySelectorAll<HTMLButtonElement>('.file .read').forEach((el) => {
     el.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -481,32 +547,178 @@ function overrideModal(book: BookRecord, override?: BookOverride): void {
   });
 }
 
-/* ---------- 全文识别覆盖 ---------- */
+/* ---------- 全文识别 ---------- */
+/** OCR 任务进度百分比：已完成本数 + 当前这本的页进度。 */
+function ocrPct(job: OcrJobState): number {
+  if (job.status === 'done') return 100;
+  if (!job.fileTotal) return 0;
+  const inFile = job.pageTotal ? Math.min(1, job.page / job.pageTotal) : 0;
+  return Math.min(99, Math.round(((job.fileIndex - 1 + inFile) / job.fileTotal) * 100));
+}
+
+/** 进度面板只在弹层打开时存在，订阅是全局的，找不到元素就静默跳过。 */
+function renderOcrJob(job: OcrJobState): void {
+  const fill = document.getElementById('x-fill');
+  if (!fill) return;
+  fill.style.width = `${ocrPct(job)}%`;
+  const line = document.getElementById('x-line')!;
+  const logBox = document.getElementById('x-log')!;
+  const running = job.status === 'running';
+  const start = document.getElementById('x-start') as HTMLButtonElement | null;
+  const cancel = document.getElementById('x-cancel') as HTMLButtonElement | null;
+  if (start) start.disabled = running;
+  if (cancel) cancel.classList.toggle('hidden', !running);
+
+  const LABEL: Record<OcrJobState['status'], string> = {
+    idle: '待开始', running: '识别中', done: '已完成', error: '失败', canceled: '已取消',
+  };
+  const parts = [LABEL[job.status]];
+  if (job.fileTotal) parts.push(`第 ${job.fileIndex}/${job.fileTotal} 本`);
+  if (job.currentName) parts.push(job.currentName);
+  if (job.pageTotal) parts.push(`第 ${job.page} / ${job.pageTotal} 页`);
+  if (job.doneFiles) parts.push(`已整本完成 ${job.doneFiles} 个`);
+  if (job.error) parts.push(job.error);
+  line.className = 'msg ' + (job.status === 'error' ? 'err' : job.status === 'done' ? 'ok' : '');
+  line.textContent = parts.join(' · ');
+  logBox.textContent = job.log.slice(-12).join('\n');
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
 async function ocrModal(): Promise<void> {
   const s = await window.fz.ocrSummary();
   state.ocrTotalFiles = s.totalFiles;
   state.ocrTextFiles = s.textFiles;
   state.ocrDoneFiles = s.doneFiles;
   const pct = s.totalFiles ? Math.round((s.textFiles / s.totalFiles) * 100) : 0;
+  // 运行时探测要起子进程（打包版首次可能十几秒），先把弹层开出来再补状态，
+  // 否则用户点了按钮会觉得没反应。
   const card = openModal(`
     <h2>全文识别</h2>
     <p>全文检索来自本机 OCR 文本。当前覆盖 <b>${s.textFiles}/${s.totalFiles}</b> 个文件，
       完成 <b>${s.doneFiles}</b> 个文件、<b>${s.doneBooks}/${s.totalBooks}</b> 部书。</p>
     <div class="ocrbar"><i style="width:${pct}%"></i></div>
-    <p>未覆盖的书仍可按书名、地名、志种检索和阅读 PDF；全文无结果不能解释为原书没有该内容。</p>
-    <p>识别任务需要 Python/uv 环境，桌面端暂不内置识别运行时。下载 PDF 后可在开发工具环境执行：</p>
-    <pre>uv run tools/ocr/ocr.py --dir "下载目录" --limit 20</pre>
-    <div class="row">
-      <button id="o-open" class="primary">打开 OCR 数据目录</button>
-      <button id="o-close" class="ghost">关闭</button>
-      <span id="o-note" class="msg"></span>
+    <p>只会识别<b>已经下载到本地</b>的 PDF。没识别的书仍可按书名、地名、志种检索和阅读原文；
+      全文无结果不能解释为原书没有该内容。</p>
+    <div class="ocrtask">
+      <div class="row">
+        <span>识别环境 <b id="x-runtime">检测中…</b></span>
+        <span id="x-ready" class="msg"></span>
+      </div>
+      <div id="x-hint"></div>
+      <div class="row">
+        <label>本次最多 <input id="x-limit" value="5" size="3" /> 本</label>
+        <label>每本最多 <input id="x-pages" value="0" size="4" /> 页（0 = 全部）</label>
+        <label><input id="x-force" type="checkbox" /> 重跑已识别</label>
+      </div>
+      <div class="row">
+        <button id="x-start" class="primary" disabled>开始识别</button>
+        <button id="x-cancel" class="ghost hidden">取消</button>
+        <button id="x-open" class="ghost">打开 OCR 数据目录</button>
+        <button id="x-close" class="ghost">关闭</button>
+        <span id="x-note" class="msg"></span>
+      </div>
+      <div class="ocrbar2"><i id="x-fill" style="width:0%"></i></div>
+      <div id="x-line" class="msg"></div>
+      <pre id="x-log" class="ocrlog"></pre>
     </div>`);
-  card.querySelector('#o-close')!.addEventListener('click', closeModal);
-  card.querySelector('#o-open')!.addEventListener('click', async () => {
+
+  card.querySelector('#x-close')!.addEventListener('click', closeModal);
+  card.querySelector('#x-open')!.addEventListener('click', async () => {
     const r = await window.fz.openOcrFolder();
-    const note = card.querySelector<HTMLSpanElement>('#o-note')!;
+    const note = card.querySelector<HTMLSpanElement>('#x-note')!;
     note.className = 'msg ' + (r.ok ? 'ok' : 'err');
     note.textContent = r.ok ? '已打开' : (r.error ?? '打开失败');
+  });
+  card.querySelector('#x-cancel')!.addEventListener('click', () => void window.fz.ocrRunnerCancel());
+  card.querySelector('#x-start')!.addEventListener('click', async () => {
+    const limit = Number.parseInt(card.querySelector<HTMLInputElement>('#x-limit')!.value, 10);
+    const maxPages = Number.parseInt(card.querySelector<HTMLInputElement>('#x-pages')!.value, 10);
+    const force = card.querySelector<HTMLInputElement>('#x-force')!.checked;
+    const r = await window.fz.ocrRunnerStart({
+      limit: Number.isFinite(limit) && limit > 0 ? limit : 5,
+      maxPages: Number.isFinite(maxPages) && maxPages > 0 ? maxPages : 0,
+      force,
+    });
+    if (!r.ok) {
+      const note = card.querySelector<HTMLSpanElement>('#x-note')!;
+      note.className = 'msg err';
+      note.textContent = r.error ?? '启动失败';
+    }
+  });
+
+  const st = await window.fz.ocrRunnerStatus();
+  const runtime = card.querySelector<HTMLElement>('#x-runtime');
+  const ready = card.querySelector<HTMLElement>('#x-ready');
+  const start = card.querySelector<HTMLButtonElement>('#x-start');
+  const hint = card.querySelector<HTMLElement>('#x-hint');
+  if (!runtime || !ready || !start || !hint) return;
+  runtime.textContent = st.runtime.label;
+  const ok = !!st.runtime.runtime;
+  ready.className = 'msg ' + (ok ? 'ok' : 'err');
+  ready.textContent = ok ? '可用' : '不可用';
+  start.disabled = !ok;
+  hint.innerHTML = ok ? '' : `<p class="msg err">${esc(st.runtime.note || '未检测到 uv 或 Python 识别环境')}<br>
+    需要先安装 <code>uv</code>（推荐）或带 <code>pymupdf</code>、<code>rapidocr-onnxruntime</code> 的 Python 3.12。</p>`;
+  renderOcrJob(st.job);
+}
+
+/** 详情面板里的「识别本书」：只跑这本书本地已有的 PDF。 */
+async function ocrBook(fids: string[]): Promise<void> {
+  const r = await window.fz.ocrRunnerStart({ limit: Math.max(1, fids.length), fids });
+  alert(r.ok ? '已开始识别，进度见「工具 → 全文识别」。' : (r.error ?? '启动失败'));
+}
+
+/* ---------- 书签与最近阅读 ---------- */
+function libRow(kind: 'mark' | 'recent', fid: string, title: string, fileName: string, page: number, id: string, time: string): string {
+  return `<div class="librow" data-kind="${kind}" data-id="${esc(id)}" data-fid="${esc(fid)}">
+    <button class="primary open" data-page="${page}">打开</button>
+    <span class="ln" title="${esc(fileName || title)}">${esc(title || fileName || '（未知文件）')}</span>
+    <span class="lp">第 ${page} 页</span>
+    <span class="lt">${esc(time)}</span>
+    ${kind === 'mark' ? '<button class="ghost del">删除</button>' : ''}
+  </div>`;
+}
+
+async function libraryModal(): Promise<void> {
+  const lib = await window.fz.marksList();
+  const recent = await window.fz.recentList();
+  const card = openModal(`
+    <h2>书签与最近阅读</h2>
+    <p>这些记录只保存在本机，不随索引更新丢失，也不上传。</p>
+    <h3>书签（${lib.marks.length}）</h3>
+    <div class="liblist">${lib.marks.length
+      ? lib.marks.map((m) => libRow('mark', m.fid, m.title, m.fileName, m.page, m.id, new Date(m.createdAt).toLocaleString('zh-CN'))).join('')
+      : '<div class="empty">还没有书签。阅读时点右上角「☆ 书签」收藏当前页。</div>'}</div>
+    <h3>最近阅读（${recent.length}）</h3>
+    <div class="liblist">${recent.length
+      ? recent.map((r) => libRow('recent', r.fid, r.title, r.fileName, r.page, r.fid, new Date(r.at).toLocaleString('zh-CN'))).join('')
+      : '<div class="empty">还没有阅读记录。</div>'}</div>
+    <div class="row">
+      <button id="l-clear" class="ghost">清空最近阅读</button>
+      <button id="l-close" class="ghost">关闭</button>
+      <span id="l-msg" class="msg"></span>
+    </div>`);
+
+  card.querySelector('#l-close')!.addEventListener('click', closeModal);
+  card.querySelector('#l-clear')!.addEventListener('click', async () => {
+    await window.fz.recentClear();
+    closeModal();
+    void libraryModal();
+  });
+
+  card.querySelectorAll<HTMLElement>('.librow').forEach((row) => {
+    const fid = row.dataset.fid ?? '';
+    const title = row.querySelector('.ln')?.textContent ?? '';
+    const page = Number(row.querySelector<HTMLElement>('.open')?.dataset.page ?? '1');
+    row.querySelector<HTMLButtonElement>('.open')?.addEventListener('click', () => {
+      closeModal();
+      void openReader(fid, title, undefined, page);
+    });
+    row.querySelector<HTMLButtonElement>('.del')?.addEventListener('click', async () => {
+      await window.fz.markRemove(row.dataset.id ?? '');
+      closeModal();
+      void libraryModal();
+    });
   });
 }
 
@@ -611,6 +823,22 @@ let readerOcrPages = 0;
 let readerHits: Array<{ p: number; n: number }> = [];
 let readerHitIdx = -1;
 let readerQuery = '';
+/** 这本书已收藏的页码。进阅读器时拉一次，翻页只查内存。 */
+let readerMarks = new Set<number>();
+
+/** 书签按钮反映「当前这一页是否已收藏」。 */
+function renderMarkBtn(): void {
+  const btn = $('r-mark');
+  const on = readerFid ? readerMarks.has(readerPage) : false;
+  btn.textContent = on ? '★ 已收藏' : '☆ 书签';
+  btn.classList.toggle('on', on);
+}
+
+/** 翻到新页：更新书签按钮，并记一条最近阅读（主进程内部会合并高频调用）。 */
+function afterPageTurn(no: number): void {
+  renderMarkBtn();
+  if (readerFid) void window.fz.recentTouch(readerFid, no);
+}
 
 const readerLimit = (): number => (readerMode === 'ocr' ? readerOcrPages : readerDoc?.numPages ?? 0);
 const posKey = (fid: string): string => `fz:last-page:${fid}`;
@@ -661,6 +889,7 @@ async function renderReaderPage(n: number): Promise<void> {
     readerPage = no;
     $<HTMLInputElement>('r-page').value = String(no);
     if (readerFid) localStorage.setItem(posKey(readerFid), String(no));
+    afterPageTurn(no);
   } catch (e) {
     // 翻页太快会取消上一次渲染，这不是错误
     if ((e as Error).name === 'RenderingCancelledException') return;
@@ -678,6 +907,7 @@ async function renderOcrPage(n: number): Promise<void> {
   readerPage = no;
   $<HTMLInputElement>('r-page').value = String(no);
   if (readerFid) localStorage.setItem(posKey(readerFid), String(no));
+  afterPageTurn(no);
   $('r-msg').classList.add('hidden');
   $<HTMLCanvasElement>('r-canvas').classList.add('hidden');
   const box = $('r-text');
@@ -797,6 +1027,14 @@ async function showReader(
   readerHits = [];
   readerHitIdx = -1;
   readerQuery = '';
+  readerMarks = new Set();
+  renderMarkBtn();
+  // 书签异步取，别挡住 PDF 加载；回来时确认还是同一本书
+  void window.fz.marksList().then((lib) => {
+    if (readerFid !== fid) return;
+    readerMarks = new Set(lib.marks.filter((m) => m.fid === fid).map((m) => m.page));
+    renderMarkBtn();
+  });
   $<HTMLInputElement>('r-q').value = '';
   $('r-q').classList.add('hidden');
   $('r-hits').classList.add('hidden');
@@ -843,6 +1081,9 @@ async function showReader(
     readerFit = true;
     $('r-fit').textContent = '适应宽度';
     readerPage = Math.min(savedPage(fid), doc.numPages);
+    // 文档确实打开了就先记一条最近阅读：首屏渲染偶尔会失败/被打断，
+    // 那种情况下也不该把「用户读过这本书」这件事漏掉。
+    if (readerFid) void window.fz.recentTouch(readerFid, readerPage);
     await renderReaderPage(readerPage);
   } catch (e) {
     if (seq !== readerSeq) return;
@@ -850,8 +1091,14 @@ async function showReader(
   }
 }
 
-/** at 用于从全文命中直接跳页：打开后切到 OCR 文本并定位到该页、带上高亮词。 */
-async function openReader(fid: string, name: string, at?: { page: number; q: string }): Promise<void> {
+/** at 用于从全文命中直接跳页：打开后切到 OCR 文本并定位到该页、带上高亮词。
+ *  gotoPage 用于书签/最近阅读：只跳页，不带查询词。 */
+async function openReader(
+  fid: string,
+  name: string,
+  at?: { page: number; q: string },
+  gotoPage?: number,
+): Promise<void> {
   const r = await window.fz.readerResolve(fid);
   if (!r.ok) {
     if (r.needCookie) {
@@ -867,6 +1114,8 @@ async function openReader(fid: string, name: string, at?: { page: number; q: str
           $('r-hits').classList.remove('hidden');
           $('r-hits').textContent = `${Math.max(1, readerHitIdx + 1)}/${res.hits.length} 页 · 共 ${res.total} 处`;
           await renderOcrPage(at.page);
+        } else if (gotoPage) {
+          await renderOcrPage(gotoPage);
         }
         return;
       }
@@ -877,7 +1126,10 @@ async function openReader(fid: string, name: string, at?: { page: number; q: str
     return;
   }
   await showReader(r.url!, name, r.mode ?? 'online', fid);
-  if (!at) return;
+  if (!at) {
+    if (gotoPage && gotoPage > 1) await renderReaderPage(gotoPage);
+    return;
+  }
   const res = await window.fz.ocrSearch(fid, at.q);
   readerQuery = at.q;
   readerHits = res.hits;
@@ -893,6 +1145,12 @@ async function openReader(fid: string, name: string, at?: { page: number; q: str
 
 $('r-prev').addEventListener('click', () => void renderReaderPage(readerTarget - 1));
 $('r-next').addEventListener('click', () => void renderReaderPage(readerTarget + 1));
+$('r-mark').addEventListener('click', async () => {
+  if (!readerFid) return;
+  const r = await window.fz.markToggle(readerFid, readerPage);
+  readerMarks = new Set(r.marks.filter((m) => m.fid === readerFid).map((m) => m.page));
+  renderMarkBtn();
+});
 $('r-close').addEventListener('click', () => void closeReader());
 $('r-pdf').addEventListener('click', () => setReaderMode('pdf'));
 $('r-ocr').addEventListener('click', () => setReaderMode('ocr'));
@@ -993,6 +1251,7 @@ for (const b of document.querySelectorAll<HTMLElement>('.toolmenu button')) {
 }
 $('btn-cookie').addEventListener('click', () => void cookieModal());
 $('btn-ocr').addEventListener('click', () => void ocrModal());
+$('btn-lib').addEventListener('click', () => void libraryModal());
 $('btn-dl').addEventListener('click', async () => {
   const tray = $('dltray');
   if (tray.classList.contains('hidden')) {
@@ -1027,6 +1286,23 @@ window.fz.onCrawlProgress((p) => {
 window.fz.onDlProgress((s) => {
   dl.set(s.fid, s);
   renderDl();
+});
+
+window.fz.onOcrProgress(renderOcrJob);
+window.fz.onOcrDone((r) => {
+  // 识别进程直接改了索引文件，主进程已重载；这边刷新覆盖度和列表。
+  void (async () => {
+    const s = await window.fz.ocrSummary();
+    state.ocrTotalFiles = s.totalFiles;
+    state.ocrTextFiles = s.textFiles;
+    state.ocrDoneFiles = s.doneFiles;
+    const line = document.getElementById('x-line');
+    if (line && !r.ok && r.note) {
+      line.className = 'msg err';
+      line.textContent = r.note;
+    }
+    if (r.ok) await boot();
+  })();
 });
 
 void boot();

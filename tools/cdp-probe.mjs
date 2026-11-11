@@ -99,6 +99,19 @@ async function typeQuery(q, expectSummary) {
 
 await sleep(1500);
 
+// 上一轮探针可能把窗口留在别的查询/筛选状态，先恢复到「浏览全部」再断言。
+// 清空输入会触发一次防抖检索，必须等它和启动时的首屏渲染都落地，否则后面的
+// 断言会读到二次渲染前的旧列表。
+await evaluate(ws, `(()=>{
+  const q=document.getElementById('q'); q.value=''; q.dispatchEvent(new Event('input',{bubbles:true}));
+  const strict=document.getElementById('strict'); strict.checked=false; strict.dispatchEvent(new Event('change',{bubbles:true}));
+  const reset=document.getElementById('btn-reset'); if(!reset.classList.contains('hidden')) reset.click();
+})()`);
+await waitFor(`document.getElementById('summary').textContent.includes('浏览全部') && document.querySelectorAll('.book').length === 50 && document.getElementById('status-right').textContent.length > 0`, 20000);
+// 冷启动时首屏 boot() 还要跑分面、下载队列、全文统计，链路比单次检索长；
+// 留一段静置时间，否则后续断言会撞上首屏那次渲染。
+await sleep(1500);
+
 await check('窗口标题', 'document.title', (v) => v === '方志检索');
 await check('副标题(分享名)', `document.getElementById('subtitle').textContent`, (v) => !!v && v !== '载入中…' && v !== '未找到索引');
 await check('状态栏统计', `document.getElementById('status-right').textContent`, (v) => /4600/.test(v) && /3149/.test(v));
@@ -151,16 +164,85 @@ await waitFor(`!!document.querySelector('.empty')`);
 await check('无结果提示', `document.querySelector('.empty')?.textContent`, (v) => /没有匹配/.test(v));
 await check('无结果时收起旧详情', `document.getElementById('detail').classList.contains('hidden')`, (v) => v === true);
 
-// 工具菜单与全文覆盖
+// 工具菜单、全文识别与内置识别运行时
 await evaluate(ws, `document.getElementById('btn-ocr').click()`);
-await waitFor(`!!document.getElementById('o-open')`);
+await waitFor(`!!document.getElementById('x-start')`);
+// 运行时探测在弹层打开后才异步返回，等它落地再断言
+await waitFor(`/可用|不可用/.test(document.getElementById('x-ready')?.textContent ?? '')`, 120000);
 await check('全文识别覆盖说明', `document.getElementById('modal-card').textContent`, (v) => /全文检索/.test(v) && /10\/4600/.test(v));
-await evaluate(ws, `document.getElementById('o-close').click()`);
+await check('识别运行时已探测', `document.getElementById('modal-card').textContent`, (v) => /uv run|项目 \.venv|python|不可用/.test(v));
+await check('识别任务控件就绪', `!!document.getElementById('x-start') && !!document.getElementById('x-limit') && !!document.getElementById('x-fill')`, (v) => v === true);
+await evaluate(ws, `document.getElementById('x-close').click()`);
 await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+
+// 书签与最近阅读面板
+await evaluate(ws, `document.getElementById('btn-lib').click()`);
+await waitFor(`!!document.getElementById('l-clear')`);
+await check('书签面板两栏都在', `document.querySelectorAll('#modal-card h3').length`, (v) => v === 2);
+await check('空态提示', `document.getElementById('modal-card').textContent`, (v) => /书签|阅读记录/.test(v));
+await evaluate(ws, `document.getElementById('l-close').click()`);
+await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+
+// 真跑一本识别（默认关闭：慢，且会往真实数据目录写 OCR 结果）
+if (process.env.FZ_CDP_RUN_OCR === '1') {
+  await evaluate(ws, `document.getElementById('btn-ocr').click()`);
+  await waitFor(`!!document.getElementById('x-start')`);
+  await evaluate(ws, `(()=>{document.getElementById('x-limit').value='1';document.getElementById('x-pages').value='1';})()`);
+  await evaluate(ws, `document.getElementById('x-start').click()`);
+  await waitFor(`/已完成|失败/.test(document.getElementById('x-line').textContent)`, 180000);
+  await check('内置识别跑完一本', `document.getElementById('x-line').textContent`, (v) => /已完成/.test(v));
+  await check('识别进度有页码反馈', `document.getElementById('x-log').textContent`, (v) => /page \d+\/\d+|没有待识别|已整本完成|-> ocr/.test(v));
+  await evaluate(ws, `document.getElementById('x-close').click()`);
+  await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+}
+
+// 阅读器里的书签闭环：只有本地已下载的 PDF 能离线打开，读不到就跳过。
+// 不写真实用户目录（书签落在 FZ_USER_DATA_DIR 指定的隔离目录里）。
+if (process.env.FZ_CDP_SKIP_READER !== '1') {
+  await typeQuery('序列目录', '直接命中');
+  await waitFor(`/序列目录/.test(document.querySelector('.book .t')?.textContent ?? '')`, 10000);
+  await evaluate(ws, `document.querySelector('.book')?.click()`);
+  await waitFor(`!!document.querySelector('.detail .file .read')`);
+  const hasLocal = await evaluate(ws, `!!document.querySelector('.detail .file .read')`);
+  if (hasLocal) {
+    await evaluate(ws, `document.querySelector('.detail .file .read').click()`);
+    await waitFor(`!document.getElementById('reader').classList.contains('hidden') && !!document.getElementById('r-mark')`, 20000);
+    await sleep(1200);
+    await check('阅读器画布已渲染', `!document.getElementById('r-canvas').classList.contains('hidden')`, (v) => v === true);
+    await check('阅读器书签按钮初始未选中', `document.getElementById('r-mark').textContent`, (v) => /书签/.test(v) && !/已收藏/.test(v));
+    await evaluate(ws, `document.getElementById('r-mark').click()`);
+    await waitFor(`/已收藏/.test(document.getElementById('r-mark').textContent)`, 8000);
+    await check('点书签后变为已收藏', `document.getElementById('r-mark').textContent`, (v) => /已收藏/.test(v));
+
+    // 面板里应出现这条书签，并且最近阅读已记一条
+    await evaluate(ws, `document.getElementById('r-close').click()`);
+    await sleep(300);
+    await evaluate(ws, `document.getElementById('btn-lib').click()`);
+    await waitFor(`!!document.getElementById('l-clear')`);
+    await check('书签已落库', `document.querySelectorAll('.librow[data-kind="mark"]').length`, (v) => v >= 1);
+    await check('最近阅读已记录', `document.querySelectorAll('.librow[data-kind="recent"]').length`, (v) => v >= 1);
+
+    // 从书签直接跳回原页
+    await evaluate(ws, `document.querySelector('.librow[data-kind="mark"] .open').click()`);
+    await waitFor(`!document.getElementById('reader').classList.contains('hidden')`, 15000);
+    await sleep(1000);
+    await check('从书签可跳回阅读器', `!document.getElementById('reader').classList.contains('hidden')`, (v) => v === true);
+    await evaluate(ws, `document.getElementById('r-mark').click()`);
+    await waitFor(`!/已收藏/.test(document.getElementById('r-mark').textContent)`, 8000);
+    await check('再点一次取消收藏', `document.getElementById('r-mark').textContent`, (v) => !/已收藏/.test(v));
+    await evaluate(ws, `document.getElementById('r-close').click()`);
+  } else {
+    console.log('SKIP  阅读器书签闭环（本地没有已下载的 PDF）');
+  }
+}
 
 // 人工校正入口（只打开，不写数据）
 await typeQuery('保定府志', '保定府志');
-await evaluate(ws, `document.querySelector('.book').click()`);
+// 按书名精确点开，别依赖「第一条」——首屏刷新可能还在路上
+await waitFor(`[...document.querySelectorAll('.book .t')].some((e) => e.textContent === '保定府志')`, 15000);
+await check('详情前列表已刷新', `document.querySelector('.book .t')?.textContent`, (v) => v === '保定府志');
+await evaluate(ws, `[...document.querySelectorAll('.book')].find((b) => b.querySelector('.t')?.textContent === '保定府志')?.click()`);
+await waitFor(`document.querySelector('.detail h2')?.textContent === '保定府志'`, 10000);
 await waitFor(`!!document.querySelector('#d-edit')`);
 await evaluate(ws, `document.getElementById('d-edit').click()`);
 await waitFor(`!!document.getElementById('o-title')`);

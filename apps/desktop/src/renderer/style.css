@@ -370,6 +370,30 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
 }
 .ocrbar { height: 6px; margin: 10px 0; background: var(--line); border-radius: 3px; overflow: hidden; }
 .ocrbar i { display: block; height: 100%; background: var(--accent); }
+.ocrtask { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; }
+.ocrtask .row { flex-wrap: wrap; }
+.ocrtask input[type="text"], .ocrtask input:not([type]) {
+  width: 56px; padding: 3px 6px; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 5px; font: inherit;
+}
+.ocrbar2 { height: 8px; margin: 8px 0 4px; background: var(--line); border-radius: 4px; overflow: hidden; }
+.ocrbar2 i { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+.ocrlog {
+  margin: 6px 0 0; padding: 8px 10px; max-height: 160px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--fg-dim); font: 11px/1.55 Consolas, monospace; white-space: pre-wrap;
+}
+.liblist { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; max-height: 220px; overflow-y: auto; }
+.liblist .empty { padding: 12px; }
+.librow {
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+  border-top: 1px solid var(--line); font-size: 12px;
+}
+.librow:first-child { border-top: none; }
+.librow .ln { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.librow .lp { flex: 0 0 auto; color: var(--fg-dim); }
+.librow .lt { flex: 0 0 auto; color: var(--fg-dim); font-size: 11px; opacity: .8; }
+.librow button { padding: 2px 8px; font-size: 11px; }
 .thint { padding: 4px 12px 10px; font-size: 11px; color: var(--fg-dim); }
 
 .dltray {

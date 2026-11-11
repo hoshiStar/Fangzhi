@@ -46,6 +46,15 @@ if (existsSync(meta)) cpSync(meta, join(data, 'meta.json'));
 const ocrDir = join(repo, 'data', 'ocr');
 if (existsSync(ocrDir)) cpSync(ocrDir, join(data, 'ocr'), { recursive: true });
 
+// 识别脚本随包发：桌面端「全文识别」要能直接拉起子进程。
+// 模型（tools/ocr/models）几十 MB 且首次使用才下载，不打进包里。
+const ocrScript = join(repo, 'tools', 'ocr', 'ocr.py');
+if (existsSync(ocrScript)) {
+  const dest = join(out, 'resources', 'tools', 'ocr');
+  mkdirSync(dest, { recursive: true });
+  cpSync(ocrScript, join(dest, 'ocr.py'));
+}
+
 /** 递归收集文件，用于版本清单和 OCR 覆盖率核对。 */
 function walkFiles(dir) {
   if (!existsSync(dir)) return [];

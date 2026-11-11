@@ -18,6 +18,8 @@ import type { DlItem } from './download.ts';
 import { findLocalPath, registerReader, registerReaderSchemes } from './reader.ts';
 import type { ReaderDeps } from './reader.ts';
 import { createOcrReader } from './ocr.ts';
+import { createOcrRunner } from './ocr-runner.ts';
+import { createLibrary } from './library.ts';
 
 // 自动化检查必须使用独立用户目录，避免碰真实 cookie、下载清单和校正记录。
 // 仅测试环境显式设置；正常启动不受影响。
@@ -56,6 +58,8 @@ function resolveDataDir(): string {
 let dataDir = '';
 let cookies: CookieStore;
 let downloads: DownloadManager;
+let ocrRunner: ReturnType<typeof createOcrRunner>;
+let library: ReturnType<typeof createLibrary>;
 let bookOverrides: BookOverrideFile = emptyBookOverrides();
 let settings: { downloadDir: string; dataDir?: string } = { downloadDir: '' };
 
@@ -149,6 +153,34 @@ const readerDeps = (): ReaderDeps => ({
 
 /** OCR 文本读取，延迟取值同上。 */
 const ocr = createOcrReader({ index: () => idx, dataDir: () => dataDir });
+
+/**
+ * 识别脚本位置。开发版在仓库里；打包版随 resources 一起发（见 package-portable.mjs）。
+ * cwd 给 uv 用：它会在这里找 .venv / 缓存，跑到别处会重新解析依赖。
+ */
+function resolveOcrScript(): { script: string; cwd: string } {
+  const rel = join('tools', 'ocr', 'ocr.py');
+  const packaged = join(process.resourcesPath, rel);
+  if (app.isPackaged && existsSync(packaged)) return { script: packaged, cwd: process.resourcesPath };
+  let p = __dirname;
+  for (let i = 0; i < 6; i++) {
+    p = dirname(p);
+    if (existsSync(join(p, rel))) return { script: join(p, rel), cwd: p };
+  }
+  return { script: packaged, cwd: process.resourcesPath };
+}
+
+/** 识别进程直接改了 index.full.json，这里重新读回来并复用人工作过的校正。 */
+function reloadIndexFromDisk(): void {
+  try {
+    const fresh = JSON.parse(readFileSync(idxPath, 'utf8')) as GazetteerIndex;
+    applyBookOverrides(fresh, bookOverrides);
+    idx = fresh;
+    writeJson('index.lean.json', toLean(fresh));
+  } catch {
+    // 读不回来不动内存里的旧索引：界面还能用，只是看不到新识别结果
+  }
+}
 
 function registerIpc(): void {
   ipcMain.handle('info', () => ({
@@ -363,6 +395,19 @@ function registerIpc(): void {
     const err = await shell.openPath(dir);
     return err ? { ok: false, error: err } : { ok: true, dir };
   });
+
+  /** 内置识别任务：启动前先探测运行时，跑完自动重载索引。 */
+  ipcMain.handle('ocr-runner-status', () => ocrRunner.status());
+  ipcMain.handle('ocr-runner-start', (_e, opts: Parameters<typeof ocrRunner.start>[0]) => ocrRunner.start(opts));
+  ipcMain.handle('ocr-runner-cancel', () => ocrRunner.cancel());
+
+  /** 书签与最近阅读：只存在本机，不进索引，跟随用户目录走。 */
+  ipcMain.handle('marks-list', () => library.list());
+  ipcMain.handle('mark-toggle', (_e, fid: string, page: number) => library.toggleMark(fid, page));
+  ipcMain.handle('mark-remove', (_e, id: string) => library.removeMark(id));
+  ipcMain.handle('recent-touch', (_e, fid: string, page: number) => library.touch(fid, page));
+  ipcMain.handle('recent-list', () => library.list().recent);
+  ipcMain.handle('recent-clear', () => library.clearRecent());
 }
 
 /** 爬取拿到的 meta 缺 shareUrl 之外的字段时，沿用旧索引里的。 */
@@ -417,6 +462,18 @@ app.whenReady().then(() => {
   });
   downloads.restore();
   if (cookies.has()) downloads.resumePending();
+  ocrRunner = createOcrRunner({
+    scriptPath: () => resolveOcrScript().script,
+    cwd: () => resolveOcrScript().cwd,
+    dataDir: () => dataDir,
+    downloadDir: () => settings.downloadDir,
+    onProgress: (s) => send('ocr-progress', s),
+    onFinished: (ok, note) => {
+      if (ok) reloadIndexFromDisk();
+      send('ocr-done', { ok, note });
+    },
+  });
+  library = createLibrary(join(app.getPath('userData'), 'library.json'), { index: () => idx });
   registerIpc();
   registerReader(readerDeps());
   createWindow();

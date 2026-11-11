@@ -11,12 +11,13 @@
 
 - `verify-index.ts`：会重写 `data/index.full.json` 和 `index.lean.json`，必须显式加 `--write`。
 - `tools/ocr/ocr.py`：会写 `data/ocr/*.jsonl` 并回写索引，使用前先备份索引。
+- `tools/gen-t2s.mjs`：重写 `packages/core/src/t2s.ts`（繁简单字映射表），只有升级 opencc 词典时才需要跑。
 
 ## 会访问真实网络
 
 - `verify-crawl-resume.ts`：真实爬取夸克分享，必须显式加 `--run`。
-- `tools/cdp-probe.mjs`：默认只读界面检查；账号与下载写操作需要 `FZ_CDP_ALLOW_COOKIE_MUTATION=1`，且只能在独立 `FZ_USER_DATA_DIR` 下运行。
+- `tools/cdp-probe.mjs`：默认只读界面检查；账号与下载写操作需要 `FZ_CDP_ALLOW_COOKIE_MUTATION=1`，真跑识别需要 `FZ_CDP_RUN_OCR=1`，且只能在独立 `FZ_USER_DATA_DIR` 下运行。
 
 ## OCR
 
-`tools/ocr/ocr.py` 需要 Python 3.12 和 uv，用法见仓库根目录 `README.md`。
+`tools/ocr/ocr.py` 需要 Python 3.12 和 uv，用法见仓库根目录 `README.md`。桌面端已内置执行器，日常不需要命令行。

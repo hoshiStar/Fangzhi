@@ -1,4 +1,5 @@
 import type { BookRecord, FileRecord, GazetteerIndex, LeanIndex, ExtKind } from './types.ts';
+import { toSimp } from './t2s.ts';
 
 /** 两种投影都能喂进来：桌面版传 full，小程序传 lean。 */
 export type AnyIndex = GazetteerIndex | LeanIndex;
@@ -124,6 +125,15 @@ export function splitTerms(q: string): string[] {
 }
 
 /**
+ * 检索侧的归一：索引里的书名、地名基本都是简体，但古籍研究者的引用往往是繁体
+ * （「嘉慶」「贛州」），不归一就整条搜不到。查询和字段都过一遍同一张表，
+ * 简体输入是幂等的，不会改变原有命中。
+ */
+export function normalizeForSearch(s: string | undefined): string {
+  return s ? toSimp(s.toLowerCase()) : '';
+}
+
+/**
  * 模糊命中判定用的字集。只看汉字，英文数字交给精确子串匹配。
  * 单独抽出来是为了在几千部书上复用时不必反复构造。
  */
@@ -180,7 +190,7 @@ function applyFilters(idx: AnyIndex, f: SearchFilters): { books: BookRecord[]; f
 export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): SearchResult {
   const t0 = Date.now();
   const { books, fileById } = applyFilters(idx, opts);
-  const q = query.trim().toLowerCase();
+  const q = normalizeForSearch(query.trim());
   const qChars = queryChars(q);
   const terms = splitTerms(q);
 
@@ -197,13 +207,13 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
     const matched: string[] = [];
     const fileHits: FileHit[] = [];
 
-    const title = b.title.toLowerCase();
-    const place = (b.place ?? '').toLowerCase();
-    const era = (b.era ?? '').toLowerCase();
-    const zhi = (b.zhiType ?? '').toLowerCase();
-    const disp = b.displayTitle.toLowerCase();
-    const author = (b.author ?? '').toLowerCase();
-    const edition = (b.edition ?? '').toLowerCase();
+    const title = normalizeForSearch(b.title);
+    const place = normalizeForSearch(b.place);
+    const era = normalizeForSearch(b.era);
+    const zhi = normalizeForSearch(b.zhiType);
+    const disp = normalizeForSearch(b.displayTitle);
+    const author = normalizeForSearch(b.author);
+    const edition = normalizeForSearch(b.edition);
 
     if (q) {
       // 单个词在某个字段上的得分。多词查询对每个词各算一次。
@@ -226,9 +236,9 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
       };
 
       const fileHas = (t: string): boolean => files.some((fl) => {
-        const nm = fl.name.toLowerCase();
-        const sec = ('section' in fl && fl.section ? fl.section : '').toLowerCase();
-        const vol = (fl.volume ?? '').toLowerCase();
+        const nm = normalizeForSearch(fl.name);
+        const sec = 'section' in fl ? normalizeForSearch(fl.section) : '';
+        const vol = normalizeForSearch(fl.volume);
         return nm.includes(t) || (!!sec && sec.includes(t)) || (!!vol && vol.includes(t));
       });
       const termRows = terms.map((t) => ({ t, field: fieldScore(t), inFile: fileHas(t) }));
@@ -275,9 +285,9 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
       // 总分封顶：98 册的书不该靠文件数量压过书名精确命中的单册书。
       let fileScore = 0;
       for (const fl of files) {
-        const nm = fl.name.toLowerCase();
-        const sec = ('section' in fl && fl.section ? fl.section : '').toLowerCase();
-        const vol = (fl.volume ?? '').toLowerCase();
+        const nm = normalizeForSearch(fl.name);
+        const sec = 'section' in fl ? normalizeForSearch(fl.section) : '';
+        const vol = normalizeForSearch(fl.volume);
         let field: FileHit['field'] | undefined;
         for (const t of terms) {
           if (nm.includes(t)) { field = 'name'; break; }

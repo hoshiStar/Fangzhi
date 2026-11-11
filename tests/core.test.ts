@@ -5,6 +5,7 @@ import { buildIndex } from '../packages/core/src/build-index.ts';
 import { toLean } from '../packages/core/src/types.ts';
 import { search, computeFacets, countSearchableBooks } from '../packages/core/src/search.ts';
 import { applyBookOverrides, emptyBookOverrides, overrideForBook } from '../packages/core/src/book-overrides.ts';
+import { toSimp } from '../packages/core/src/t2s.ts';
 import type { GazetteerIndex, RawShareDump } from '../packages/core/src/types.ts';
 
 const META = {
@@ -107,6 +108,28 @@ test('人工校正按书目成员应用，并在重建后继续生效', () => {
   wrong.books[book.id] = { ...overrides.books[book.id]!, fileIds: ['not-this-book'] };
   const untouched = buildIndex(fixture(), { meta: META });
   assert.equal(applyBookOverrides(untouched, wrong), 0, '成员文件不匹配时不得套用校正');
+});
+
+test('繁体输入能命中简体书目，简体输入不受影响', { skip: !existsSync('data/index.full.json') }, () => {
+  const idx = JSON.parse(readFileSync('data/index.full.json', 'utf8')) as GazetteerIndex;
+
+  // 映射本身：一字对一字，简体幂等，扩展区字符不打乱后面的对齐
+  assert.equal(toSimp('贛州府志'), '赣州府志');
+  assert.equal(toSimp('光緒'), '光绪');
+  assert.equal(toSimp('赣州府志'), '赣州府志');
+  assert.equal(toSimp('志'), '志');
+
+  const trad = search(idx, '贛州府志', { limit: 10 });
+  const simp = search(idx, '赣州府志', { limit: 10 });
+  assert.ok(trad.directTotal >= 1, '繁体查询应有直接命中');
+  assert.equal(trad.total, simp.total, '繁简查询结果数应一致');
+  assert.equal(trad.items[0]?.book.id, simp.items[0]?.book.id, '繁简查询首条应一致');
+  assert.ok(trad.items[0]?.book.title.includes('赣州'), '首条应是赣州府志');
+
+  // 年代字段的繁体写法也要能对上
+  const era = search(idx, '光緒 湖南通志', { limit: 5 });
+  assert.ok(era.directTotal >= 1);
+  assert.ok(era.items[0]?.book.title.includes('湖南通志'));
 });
 
 test('桌面 full 与小程序 mini 的关键查询一致', { skip: !existsSync('data/index.full.json') || !existsSync('apps/miniprogram/index.mini.json') }, () => {

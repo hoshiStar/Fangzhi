@@ -34,6 +34,26 @@ const api = {
   searchText: (q: string) => ipcRenderer.invoke('search-text', q),
   ocrSummary: () => ipcRenderer.invoke('ocr-summary'),
   openOcrFolder: () => ipcRenderer.invoke('open-ocr-folder'),
+  ocrRunnerStatus: () => ipcRenderer.invoke('ocr-runner-status'),
+  ocrRunnerStart: (opts: { limit?: number; maxPages?: number; force?: boolean; fids?: string[] }) =>
+    ipcRenderer.invoke('ocr-runner-start', opts),
+  ocrRunnerCancel: () => ipcRenderer.invoke('ocr-runner-cancel'),
+  onOcrProgress: (cb: (p: unknown) => void) => {
+    const h = (_e: unknown, p: unknown) => cb(p);
+    ipcRenderer.on('ocr-progress', h);
+    return () => ipcRenderer.removeListener('ocr-progress', h);
+  },
+  onOcrDone: (cb: (p: unknown) => void) => {
+    const h = (_e: unknown, p: unknown) => cb(p);
+    ipcRenderer.on('ocr-done', h);
+    return () => ipcRenderer.removeListener('ocr-done', h);
+  },
+  marksList: () => ipcRenderer.invoke('marks-list'),
+  markToggle: (fid: string, page: number) => ipcRenderer.invoke('mark-toggle', fid, page),
+  markRemove: (id: string) => ipcRenderer.invoke('mark-remove', id),
+  recentTouch: (fid: string, page: number) => ipcRenderer.invoke('recent-touch', fid, page),
+  recentList: () => ipcRenderer.invoke('recent-list'),
+  recentClear: () => ipcRenderer.invoke('recent-clear'),
   onCrawlProgress: (cb: (p: unknown) => void) => {
     const h = (_e: unknown, p: unknown) => cb(p);
     ipcRenderer.on('crawl-progress', h);

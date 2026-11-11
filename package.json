@@ -19,7 +19,7 @@
     "package:desktop": "npm run package --workspace @fangzhi/desktop",
     "build:mini": "node apps/miniprogram/build.mjs",
     "typecheck": "tsc -p packages/core/tsconfig.json --noEmit",
-    "test": "node --test tests/core.test.ts tests/download.test.ts",
+    "test": "node --test tests/core.test.ts tests/download.test.ts tests/library.test.ts",
     "verify": "npm run typecheck && npm run typecheck --workspace @fangzhi/desktop && npm test && node apps/miniprogram/smoke.cjs"
   },
   "devDependencies": {
