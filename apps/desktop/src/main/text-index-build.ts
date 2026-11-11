@@ -6,7 +6,7 @@ import { loadTextFast, resolveTextPath, textCachePath, textFileMtime } from './f
 import type { TextFileTask } from './fulltext-core.ts';
 import {
   MAGIC, MAX_FILES, PAGE_UNIT, PRUNED, VERSION, decodeList, dedupeSorted, encodeDeltas, pairKey,
-  textIndexDir, writeAtomic,
+  sameMtime, textIndexDir, writeAtomic,
 } from './text-index-format.ts';
 import type { IndexedFile, TextIndex, TextIndexMeta } from './text-index-format.ts';
 import { loadTextIndex } from './text-index.ts';
@@ -680,7 +680,7 @@ function planUpdate(index: TextIndex, dataDir: string, tasks: TextFileTask[]): S
       removed++;
       continue;
     }
-    if (index.stale.has(f.fid) || cur.mtimeMs !== f.mtimeMs) {
+    if (index.stale.has(f.fid) || !sameMtime(cur.mtimeMs, f.mtimeMs)) {
       toIndex.push(cur.task);
       updated++;
       continue;

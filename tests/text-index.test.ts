@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -243,6 +243,35 @@ test('增量更新：没有任何变化就一个字节都不写', () => {
     assert.equal(textIndexSyncNeeded(root, tasks), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('增量更新：时间戳被拷贝量化到相邻一格，不当作改动', () => {
+  const { root, tasks } = fixture();
+  const copy = mkdtempSync(join(tmpdir(), 'fz-tindex-copy-'));
+  try {
+    buildTextIndex(root, tasks);
+    // 模拟打包：整棵数据目录拷到新位置。cpSync 会重设 mtime，而 NTFS 的时间戳
+    // 是 100ns 一格，重设过程把值量化到相邻一格（差 0.0003ms 这种量级）。
+    // 早先按严格相等比 mtime，结果包里的倒排索引一装进便携版就被判整库过期。
+    rmSync(copy, { recursive: true, force: true });
+    cpSync(root, copy, { recursive: true, preserveTimestamps: true });
+
+    // 量化结果依文件而异，这里再显式抖一下，保证无论如何都覆盖到这条路径
+    const metaPath = join(textIndexDir(copy), 'meta.json');
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+    meta.files[0].mtimeMs += 0.0004;
+    meta.files[1].mtimeMs -= 0.0003;
+    writeFileSync(metaPath, JSON.stringify(meta));
+
+    assert.equal(textIndexSyncNeeded(copy, tasks), false, '抖动 0.4 微秒不该触发同步');
+    const r = updateTextIndex(copy, tasks);
+    assert.equal(r.stats.changed, false);
+    assert.equal(r.stats.reused, 3);
+    assert.equal(r.stats.added + r.stats.updated + r.stats.removed, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(copy, { recursive: true, force: true });
   }
 });
 

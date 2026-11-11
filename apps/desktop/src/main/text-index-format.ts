@@ -152,3 +152,16 @@ export function writeAtomic(file: string, data: string | Buffer): void {
   writeFileSync(tmp, data);
   renameSync(tmp, file);
 }
+
+/**
+ * 时间戳是否算「同一个版本」。
+ *
+ * 严格相等踩过坑：打包时 cpSync 会重设 mtime，而 NTFS 的时间戳是 100ns 一格，
+ * 重设过程把值量化到相邻一格（差 0.0003ms 这种量级），旧的严格相等就把整库
+ * 判成过期——便携版冷启动一开就把带进去的索引全部重扫一遍，包内索引等于白带。
+ * 1ms 以内视为同一版本：真改动的时间差至少是秒级，而 stale.json 的失效标记照旧
+ * 立即生效，不会因为容差漏掉。
+ */
+export function sameMtime(a: number, b: number): boolean {
+  return a === b || Math.abs(a - b) < 1;
+}

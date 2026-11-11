@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import { countIn, loadTextFast, resolveTextPath, textCachePath, textFileMtime } from './fulltext-core.ts';
 import type { LoadedText, TextFileTask } from './fulltext-core.ts';
 import {
-  MAGIC, PAGE_UNIT, PRUNED, VERSION, bigramKeys, decodeList, findKey, textIndexDir, writeAtomic,
+  MAGIC, PAGE_UNIT, PRUNED, VERSION, bigramKeys, decodeList, findKey, sameMtime, textIndexDir,
+  writeAtomic,
 } from './text-index-format.ts';
 import type { IndexedFile, TextIndex, TextIndexMeta } from './text-index-format.ts';
 
@@ -242,7 +243,7 @@ function verifyFile(
   const r = loadTextFast(file, textCachePath(dataDir, task.fid), mtimeMs);
   if (!r) return null;
 
-  const scanPages = mtimeMs === indexedMtime ? pages : [...r.loaded.pages.keys()].sort((a, b) => a - b);
+  const scanPages = sameMtime(mtimeMs, indexedMtime) ? pages : [...r.loaded.pages.keys()].sort((a, b) => a - b);
   const hits: Array<{ p: number; n: number }> = [];
   let count = 0;
   for (const p of scanPages) {
@@ -282,7 +283,7 @@ export function textIndexSyncNeeded(dataDir: string, tasks: TextFileTask[]): boo
     const mtimeMs = textFileMtime(file);
     if (mtimeMs < 0) continue;
     seen++;
-    if (known.get(task.fid) !== mtimeMs || stale.has(task.fid)) return true;
+    if (!sameMtime(known.get(task.fid) ?? NaN, mtimeMs) || stale.has(task.fid)) return true;
   }
   // 条数对不上就说明有文件进/出，交给增量逻辑去分新增和移除
   return seen !== meta.files.length;
