@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  bigramKeys, buildTextIndex, candidatePages, coveredFids, invalidateTextIndexFiles,
-  loadTextIndex, searchTextIndex, textIndexDir, textIndexSyncNeeded, updateTextIndex,
+  bigramKeys, candidatePages, coveredFids, invalidateTextIndexFiles,
+  loadTextIndex, searchTextIndex, textIndexDir, textIndexSyncNeeded,
 } from '../apps/desktop/src/main/text-index.ts';
+import { buildTextIndex, updateTextIndex } from '../apps/desktop/src/main/text-index-build.ts';
 import { createTextIndexBuilder } from '../apps/desktop/src/main/text-index-run.ts';
 import {
   finalizeBooks, loadTextFile, mergeFileHit, normalizeText, scanAllSync, scanLoaded,
@@ -196,6 +197,11 @@ test('双字键忽略代理对，纯生僻字查询退回扫描', () => {
 
 /* ---------- 增量更新 ---------- */
 
+/** index.bin 的原始字节，用来对比「内存路径」和「落盘路径」是否等价。 */
+function binBytes(root: string): Buffer {
+  return readFileSync(join(textIndexDir(root), 'index.bin'));
+}
+
 /** 显式把 mtime 往后拨：连续写文件常落在同一毫秒，靠它保证「内容变了」看得出来。 */
 function touchAhead(file: string): void {
   const t = new Date(Date.now() + 2000);
@@ -367,6 +373,83 @@ test('同步预检：不读 index.bin 也能判断该不该同步', () => {
     const p = join(root, 'ocr', 'f-a1.jsonl');
     touchAhead(p);
     assert.equal(textIndexSyncNeeded(root, tasks), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('落盘路径与内存路径写出的 index.bin 逐字节一致', () => {
+  const { root, tasks } = fixture();
+  try {
+    // 1. 内存路径（默认预算）：整份都在内存里拼
+    buildTextIndex(root, tasks);
+    const inMemory = binBytes(root);
+    assert.ok(inMemory.length > 32);
+
+    // 2. 落盘路径：攒够 1 条就散进分桶文件，每条 posting 都走一次追加
+    rmSync(textIndexDir(root), { recursive: true, force: true });
+    const meta = buildTextIndex(root, tasks, { postingBuffer: 1 });
+    assert.deepEqual(binBytes(root), inMemory, '两条路径产出的索引必须一模一样');
+    assert.equal(meta.files.length, 3);
+    assertSameAsScan(root, tasks, ['赣州府志', '京师', '吉水']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('run 数超过归并扇入时先做中间归并，结果仍与内存路径一致', () => {
+  const { root, tasks } = fixture();
+  try {
+    buildTextIndex(root, tasks);
+    const inMemory = binBytes(root);
+
+    rmSync(textIndexDir(root), { recursive: true, force: true });
+    // 每 4 条就落一个 run、每次只归并 2 路：强制走多轮中间归并
+    const meta = buildTextIndex(root, tasks, { postingBuffer: 4, mergeFanIn: 2 });
+    assert.deepEqual(binBytes(root), inMemory, '多轮归并不能改变双字升序');
+    assert.equal(meta.bigramCount, loadTextIndex(root)!.meta.bigramCount);
+    assertSameAsScan(root, tasks, ['赣州府志', '京师', '山川']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('落盘路径写完不留临时目录', () => {
+  const { root, tasks } = fixture();
+  try {
+    buildTextIndex(root, tasks, { postingBuffer: 2, mergeFanIn: 2 });
+    const leftovers = readdirSync(textIndexDir(root)).filter((f) => f.startsWith('.build-'));
+    assert.deepEqual(leftovers, [], '临时目录必须清干净');
+    assert.deepEqual(readdirSync(textIndexDir(root)).sort(), ['index.bin', 'meta.json', 'stale.json']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('落盘路径下的增量更新（含剪枝标记）与全量重建等价', () => {
+  const { root, tasks } = fixture();
+  try {
+    // dfCap=1：出现两次以上的双字全被剪枝，增量必须把这些 PRUNED 条目原样搬过去
+    buildTextIndex(root, tasks, { dfCap: 1 });
+    assert.ok(loadTextIndex(root)!.meta.prunedBigrams > 0);
+
+    const next = [...tasks, addTask(root, 'f-c1', 'book-c', '（乾隆）贛州府志', [
+      page(1, '贛州府志卷四　學校　京師形勝'),
+    ])];
+    const inc = updateTextIndex(root, next, { dfCap: 1, postingBuffer: 2 });
+    assert.equal(inc.stats.added, 1);
+    const incremental = binBytes(root);
+
+    // 同参数全量重建应当写出完全相同的字节
+    rmSync(textIndexDir(root), { recursive: true, force: true });
+    buildTextIndex(root, next, { dfCap: 1 });
+    assert.deepEqual(incremental, binBytes(root), '增量与全量重建必须等价');
+
+    // dfCap=1 时几乎所有双字都被剪掉，查询本来就落在扫描上；这里只核对字典规模
+    const rebuilt = loadTextIndex(root)!;
+    assert.equal(rebuilt.meta.prunedBigrams, inc.meta.prunedBigrams, '剪枝条目要原样搬过来');
+    assert.equal(rebuilt.meta.bigramCount, inc.meta.bigramCount);
+    assert.equal(rebuilt.meta.files.length, 4);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

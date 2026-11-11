@@ -55,7 +55,7 @@ declare global {
       buildTextIndex(): Promise<{ ok: boolean; error?: string; meta?: { bigramCount: number; postingCount: number } }>;
       syncTextIndex(): Promise<{ ok: boolean; changed: boolean; busy?: boolean; stats?: IndexSyncStats; error?: string }>;
       setTextIndexAuto(on: boolean): Promise<{ auto: boolean }>;
-      onTextIndexProgress(cb: (p: { done: number; total: number }) => void): () => void;
+      onTextIndexProgress(cb: (p: { done: number; total: number; phase?: 'scan' | 'merge' }) => void): () => void;
       onTextIndexAuto(cb: (p: { state: 'start' | 'done' | 'error'; reason?: string; stats?: IndexSyncStats; error?: string }) => void): () => void;
       openOcrFolder(): Promise<{ ok: boolean; dir?: string; error?: string }>;
       ocrRunnerStatus(): Promise<{ job: OcrJobState; runtime: { runtime: string; label: string; note: string } }>;
@@ -574,9 +574,10 @@ async function textIndexModal(): Promise<void> {
   };
   render(initial);
 
-  const offProgress = window.fz.onTextIndexProgress(({ done, total }) => {
+  const offProgress = window.fz.onTextIndexProgress(({ done, total, phase }) => {
     msg.className = 'msg';
-    msg.textContent = `构建中 ${done}/${total}`;
+    // 大语料会先扫正文再分批整理，两段的进度分母完全不同，得分开说
+    msg.textContent = phase === 'merge' ? `整理倒排 ${done}/${total} 条` : `扫描文本 ${done}/${total} 个文件`;
   });
   const offAuto = window.fz.onTextIndexAuto(({ state }) => {
     if (state === 'start') {

@@ -85,7 +85,7 @@ console.log('second query in same worker', Date.now() - t1, 'ms', JSON.stringify
 if (r3.result.total !== r1.result.total) throw new Error('缓存前后结果不一致');
 
 // 6. 建倒排索引后换一个 worker 再查：应当走索引，且结果与扫描一致
-const textIndexModule = await import(new URL('../apps/desktop/src/main/text-index.ts', import.meta.url).href);
+const textIndexModule = await import(new URL('../apps/desktop/src/main/text-index-build.ts', import.meta.url).href);
 const meta = textIndexModule.buildTextIndex(root, files);
 console.log('index built', JSON.stringify({ bigrams: meta.bigramCount, postings: meta.postingCount }));
 const w3 = new Worker(resolve('apps/desktop/dist/main/fulltext-worker.cjs'));

@@ -10,9 +10,8 @@
 // 所以重复构建大多只花在拼 postings 上。--update 是桌面端「识别完自动同步」走的同一条路。
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import {
-  buildTextIndex, loadTextIndex, candidatePages, bigramKeys, updateTextIndex,
-} from '../apps/desktop/src/main/text-index.ts';
+import { buildTextIndex, updateTextIndex } from '../apps/desktop/src/main/text-index-build.ts';
+import { loadTextIndex, candidatePages, bigramKeys } from '../apps/desktop/src/main/text-index.ts';
 import type { TextFileTask } from '../apps/desktop/src/main/fulltext-core.ts';
 import { normalizeText } from '../apps/desktop/src/main/fulltext-core.ts';
 
@@ -46,8 +45,12 @@ if (!tasks.length) {
 const dfCap = Number(process.env.FZ_DF_CAP ?? '') || undefined;
 console.log(`${incremental ? '增量更新' : '全量重建'}倒排索引：${tasks.length} 个 OCR 文件，dfCap=${dfCap ?? '沿用索引设置'}`);
 const t0 = Date.now();
-const onProgress = (done: number, total: number): void => {
-  if (done % 200 === 0 || done === total) process.stdout.write(`\r  已索引 ${done}/${total} 个文件`);
+const onProgress = (done: number, total: number, phase: 'scan' | 'merge'): void => {
+  if (phase === 'merge') {
+    if (done % 50 === 0 || done === total) process.stdout.write(`\r  整理倒排 ${done}/${total} 条`);
+    return;
+  }
+  if (done % 200 === 0 || done === total) process.stdout.write(`\r  已扫描 ${done}/${total} 个文件`);
 };
 const meta = incremental
   ? (() => {

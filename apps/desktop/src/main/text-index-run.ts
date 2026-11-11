@@ -1,14 +1,15 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
-import { buildTextIndex, updateTextIndex } from './text-index.ts';
-import type { IndexUpdateStats, TextIndexMeta } from './text-index.ts';
+import { buildTextIndex, updateTextIndex } from './text-index-build.ts';
+import type { BuildPhase, IndexUpdateStats } from './text-index-build.ts';
+import type { TextIndexMeta } from './text-index-format.ts';
 import type { TextFileTask } from './fulltext-core.ts';
 
 export interface TextIndexBuildDeps {
   tasks(): TextFileTask[];
   dataDir(): string;
-  onProgress?: (p: { done: number; total: number }) => void;
+  onProgress?: (p: { done: number; total: number; phase: BuildPhase }) => void;
   /** 默认取同目录的 text-index-worker.cjs（见 scripts/build.mjs）。 */
   workerFile?: string;
 }
@@ -61,10 +62,10 @@ export function createTextIndexBuilder(deps: TextIndexBuildDeps) {
       try {
         // rethrow：同步路径没有线程边界，异常必须自己兜住
         if (mode === 'update') {
-          const r = updateTextIndex(dataDir, tasks, { onProgress: (done, total) => deps.onProgress?.({ done, total }) });
+          const r = updateTextIndex(dataDir, tasks, { onProgress: (done, total, phase) => deps.onProgress?.({ done, total, phase }) });
           return { ok: true, meta: r.meta, stats: r.stats };
         }
-        const meta = buildTextIndex(dataDir, tasks, { onProgress: (done, total) => deps.onProgress?.({ done, total }) });
+        const meta = buildTextIndex(dataDir, tasks, { onProgress: (done, total, phase) => deps.onProgress?.({ done, total, phase }) });
         return { ok: true, meta };
       } catch (e) {
         return { ok: false, error: (e as Error).message };
@@ -82,13 +83,13 @@ export function createTextIndexBuilder(deps: TextIndexBuildDeps) {
         resolve(r);
       };
       type Msg = {
-        type?: string; done?: number; total?: number;
+        type?: string; done?: number; total?: number; phase?: BuildPhase;
         meta?: TextIndexMeta; stats?: IndexUpdateStats; error?: string;
       };
       try {
         const w = new Worker(file, { workerData: { dataDir, tasks, mode } });
         w.on('message', (m: Msg) => {
-          if (m?.type === 'progress') deps.onProgress?.({ done: m.done ?? 0, total: m.total ?? 0 });
+          if (m?.type === 'progress') deps.onProgress?.({ done: m.done ?? 0, total: m.total ?? 0, phase: m.phase ?? 'scan' });
           else if (m?.type === 'done') {
             void w.terminate();
             done({ ok: true, meta: m.meta, stats: m.stats });

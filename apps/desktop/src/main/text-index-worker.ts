@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { buildTextIndex, updateTextIndex } from './text-index.ts';
+import { buildTextIndex, updateTextIndex } from './text-index-build.ts';
 import type { TextFileTask } from './fulltext-core.ts';
 
 /**
@@ -11,8 +11,8 @@ import type { TextFileTask } from './fulltext-core.ts';
  */
 const job = workerData as { dataDir: string; tasks: TextFileTask[]; mode?: 'build' | 'update' };
 
-const onProgress = (done: number, total: number): void => {
-  parentPort?.postMessage({ type: 'progress', done, total });
+const onProgress = (done: number, total: number, phase: 'scan' | 'merge'): void => {
+  parentPort?.postMessage({ type: 'progress', done, total, phase });
 };
 
 try {

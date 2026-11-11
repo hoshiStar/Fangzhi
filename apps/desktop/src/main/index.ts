@@ -23,7 +23,7 @@ import type { TextFileTask } from './fulltext-core.ts';
 import { createOcrRunner } from './ocr-runner.ts';
 import { createTextIndexBuilder } from './text-index-run.ts';
 import { invalidateTextIndexFiles, loadTextIndex, textIndexSyncNeeded } from './text-index.ts';
-import type { IndexUpdateStats } from './text-index.ts';
+import type { IndexUpdateStats } from './text-index-build.ts';
 import { createLibrary } from './library.ts';
 
 // 自动化检查必须使用独立用户目录，避免碰真实 cookie、下载清单和校正记录。
