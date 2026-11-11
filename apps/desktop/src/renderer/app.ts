@@ -48,9 +48,15 @@ declare global {
         stale: string[];
         textFiles: number;
         bytes: number;
+        auto: boolean;
+        syncing: boolean;
+        lastSync: { at: string; reason: string; ok: boolean; stats?: IndexSyncStats; error?: string } | null;
       }>;
       buildTextIndex(): Promise<{ ok: boolean; error?: string; meta?: { bigramCount: number; postingCount: number } }>;
+      syncTextIndex(): Promise<{ ok: boolean; changed: boolean; busy?: boolean; stats?: IndexSyncStats; error?: string }>;
+      setTextIndexAuto(on: boolean): Promise<{ auto: boolean }>;
       onTextIndexProgress(cb: (p: { done: number; total: number }) => void): () => void;
+      onTextIndexAuto(cb: (p: { state: 'start' | 'done' | 'error'; reason?: string; stats?: IndexSyncStats; error?: string }) => void): () => void;
       openOcrFolder(): Promise<{ ok: boolean; dir?: string; error?: string }>;
       ocrRunnerStatus(): Promise<{ job: OcrJobState; runtime: { runtime: string; label: string; note: string } }>;
       ocrRunnerStart(opts: { limit?: number; maxPages?: number; force?: boolean; fids?: string[] }): Promise<{ ok: boolean; error?: string }>;
@@ -77,6 +83,16 @@ interface DlState {
   status: 'queued' | 'linking' | 'downloading' | 'done' | 'error' | 'canceled';
   error?: string;
   dest?: string;
+}
+
+/** 和 main/text-index.ts 的 IndexUpdateStats 对应。 */
+interface IndexSyncStats {
+  added: number;
+  updated: number;
+  removed: number;
+  reused: number;
+  full: boolean;
+  changed: boolean;
 }
 
 /** 和 main/ocr-runner.ts 的 OcrJobState 对应。 */
@@ -490,6 +506,26 @@ function closeModal(): void {
 }
 
 /* ---------- 全文倒排索引 ---------- */
+const syncReasonLabel: Record<string, string> = {
+  ocr: '全文识别完成',
+  startup: '启动时补同步',
+  'data-dir': '切换数据目录',
+  toggle: '重新开启自动同步',
+  manual: '手动同步',
+};
+
+function syncSummary(stats?: IndexSyncStats): string {
+  if (!stats) return '';
+  if (stats.full) return `全量重建 ${stats.reused + stats.added} 个文件`;
+  if (!stats.changed) return '没有变化';
+  const bits: string[] = [];
+  if (stats.added) bits.push(`新增 ${stats.added}`);
+  if (stats.updated) bits.push(`更新 ${stats.updated}`);
+  if (stats.removed) bits.push(`移除 ${stats.removed}`);
+  bits.push(`沿用 ${stats.reused}`);
+  return bits.join(' · ');
+}
+
 async function textIndexModal(): Promise<void> {
   const initial = await window.fz.textIndexStatus();
   const card = openModal(`
@@ -497,40 +533,91 @@ async function textIndexModal(): Promise<void> {
     <p>倒排索引把「双字 → 页码」预先存下来：全文检索先用它定位候选页，再回正文核实，
       不必每次都把上千本书的正文读一遍。当前 <b>${initial.textFiles}</b> 个文件有识别文本。</p>
     <div id="ti-state"></div>
-    <p class="thint">识别出新文本后不必马上重建：检索会把它们按「未覆盖」整篇扫描，结果仍然是全的；
-      等积累几本再重建，速度才会回来。</p>
+    <label class="row ti-auto"><input type="checkbox" id="ti-auto" ${initial.auto ? 'checked' : ''}>
+      <span>识别完成后自动更新索引（只重扫变过的文件，通常几十毫秒）</span></label>
+    <div id="ti-sync"></div>
     <div class="row">
-      <button id="ti-build" class="primary">重建索引</button>
+      <button id="ti-sync-now" class="ghost">立即同步</button>
+      <button id="ti-build" class="primary">全量重建</button>
       <button id="ti-close" class="ghost">关闭</button>
       <span id="ti-msg" class="msg"></span>
     </div>`);
   const stateBox = card.querySelector<HTMLElement>('#ti-state')!;
+  const syncBox = card.querySelector<HTMLElement>('#ti-sync')!;
   const msg = card.querySelector<HTMLSpanElement>('#ti-msg')!;
   const btn = card.querySelector<HTMLButtonElement>('#ti-build')!;
+  const btnSync = card.querySelector<HTMLButtonElement>('#ti-sync-now')!;
+  const auto = card.querySelector<HTMLInputElement>('#ti-auto')!;
 
-  const render = (s: typeof initial): void => {
+  const render = (s: Awaited<ReturnType<typeof window.fz.textIndexStatus>>): void => {
     if (!s.built || !s.meta) {
-      stateBox.innerHTML = '<div class="row"><span class="msg">还没有倒排索引，全文检索当前逐本扫描（有位图预筛）。</span></div>';
+      stateBox.innerHTML = '<div class="row"><span class="msg">还没有倒排索引。识别出的文本会先整篇扫描，第一次同步后自动建起来。</span></div>';
+    } else {
+      const m = s.meta;
+      const when = new Date(m.builtAt);
+      const stamp = Number.isNaN(when.getTime()) ? m.builtAt : when.toLocaleString();
+      stateBox.innerHTML = `
+        <div class="row"><span>已建 · ${esc(stamp)}</span><span>· ${formatSize(s.bytes)}</span></div>
+        <div class="row"><span>覆盖 ${m.files.length} 个文件 · 双字 ${m.bigramCount}（剪枝 ${m.prunedBigrams}）· 倒排 ${m.postingCount} 条</span></div>
+        ${s.stale.length ? `<div class="row"><span class="msg">${s.stale.length} 个文件在索引之后变过，同步后进索引，此前按整篇扫描</span></div>` : ''}`;
+    }
+    const last = s.lastSync;
+    if (!last) {
+      syncBox.innerHTML = `<div class="row"><span class="thint">${s.auto ? '自动同步已开启：识别完成、启动、换目录时会自动比对增量。' : '自动同步已关闭，索引只在手动重建时更新。'}</span></div>`;
       return;
     }
-    const m = s.meta;
-    const when = new Date(m.builtAt);
-    const stamp = Number.isNaN(when.getTime()) ? m.builtAt : when.toLocaleString();
-    stateBox.innerHTML = `
-      <div class="row"><span>已建 · ${esc(stamp)}</span><span>· ${formatSize(s.bytes)}</span></div>
-      <div class="row"><span>覆盖 ${m.files.length} 个文件 · 双字 ${m.bigramCount}（剪枝 ${m.prunedBigrams}）· 倒排 ${m.postingCount} 条</span></div>
-      ${s.stale.length ? `<div class="row"><span class="msg">${s.stale.length} 个文件在索引之后变过，检索时按未覆盖整篇扫描</span></div>` : ''}`;
+    const at = new Date(last.at);
+    const stamp = Number.isNaN(at.getTime()) ? last.at : at.toLocaleTimeString();
+    const why = syncReasonLabel[last.reason] ?? last.reason;
+    const detail = last.ok ? syncSummary(last.stats) : (last.error ?? '失败');
+    syncBox.innerHTML = `<div class="row"><span class="msg ${last.ok ? 'ok' : 'err'}">最近同步 · ${esc(why)} · ${stamp} · ${esc(detail)}</span></div>`;
   };
   render(initial);
 
-  const off = window.fz.onTextIndexProgress(({ done, total }) => {
+  const offProgress = window.fz.onTextIndexProgress(({ done, total }) => {
     msg.className = 'msg';
     msg.textContent = `构建中 ${done}/${total}`;
   });
+  const offAuto = window.fz.onTextIndexAuto(({ state }) => {
+    if (state === 'start') {
+      msg.className = 'msg';
+      msg.textContent = '同步中…';
+      return;
+    }
+    void (async () => {
+      msg.className = state === 'done' ? 'msg ok' : 'msg err';
+      const now = await window.fz.textIndexStatus();
+      msg.textContent = state === 'done' ? `同步完成：${syncSummary(now.lastSync?.stats)}` : (now.lastSync?.error ?? '同步失败');
+      render(now);
+    })();
+  });
+
+  auto.addEventListener('change', async () => {
+    const r = await window.fz.setTextIndexAuto(auto.checked);
+    auto.checked = r.auto;
+    msg.className = 'msg';
+    msg.textContent = r.auto ? '已开启自动同步' : '已关闭自动同步';
+  });
+
   card.querySelector('#ti-close')!.addEventListener('click', () => {
-    off();
+    offProgress();
+    offAuto();
     closeModal();
   });
+
+  btnSync.addEventListener('click', async () => {
+    btnSync.disabled = true;
+    msg.className = 'msg';
+    msg.textContent = '比对差异…';
+    const r = await window.fz.syncTextIndex();
+    btnSync.disabled = false;
+    msg.className = r.ok ? 'msg ok' : 'msg err';
+    msg.textContent = r.ok
+      ? (r.busy ? '已有索引任务在跑' : r.changed ? `同步完成：${syncSummary(r.stats)}` : '索引已经是最新的')
+      : (r.error ?? '同步失败');
+    render(await window.fz.textIndexStatus());
+  });
+
   btn.addEventListener('click', async () => {
     btn.disabled = true;
     msg.className = 'msg';

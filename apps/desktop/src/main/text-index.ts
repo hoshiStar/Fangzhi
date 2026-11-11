@@ -143,46 +143,67 @@ function writeAtomic(file: string, data: string | Buffer): void {
 }
 
 /**
- * 建索引。输入和检索用同一份任务清单（fid + textRef），文本走 `.text-cache`，
- * 所以重复构建基本只在拼 postings。
+ * 把一个文件的正文扫进 postings。返回 null 表示这个文件没有可用文本
+ * （textRef 失效、文件被删），调用方不能给它分配下标，否则 id 会错位。
  */
-export function buildTextIndex(
+function addFileToPostings(
   dataDir: string,
-  tasks: TextFileTask[],
-  opts: BuildOptions = {},
-): TextIndexMeta {
-  const dfCap = opts.dfCap ?? 20_000;
-  const files: IndexedFile[] = [];
-  const postings = new Map<number, number[]>();
+  task: TextFileTask,
+  fidIdx: number,
+  postings: Map<number, number[]>,
+): IndexedFile | null {
+  const file = resolveTextPath(dataDir, task.textRef);
+  if (!file) return null;
+  const mtimeMs = textFileMtime(file);
+  if (mtimeMs < 0) return null;
+  const r = loadTextFast(file, textCachePath(dataDir, task.fid), mtimeMs);
+  if (!r) return null;
 
-  for (let i = 0; i < tasks.length; i++) {
-    const task = tasks[i]!;
-    const file = resolveTextPath(dataDir, task.textRef);
-    const mtimeMs = file ? textFileMtime(file) : -1;
-    if (!file || mtimeMs < 0) continue;
-    const r = loadTextFast(file, textCachePath(dataDir, task.fid), mtimeMs);
-    if (!r) continue;
-    const fidIdx = files.length;
-    files.push({ fid: task.fid, mtimeMs, pages: r.loaded.pages.size });
-
-    for (const [p, np] of r.loaded.norm) {
-      const text = np.n;
-      if (text.length < 2) continue;
-      // 同一页同一个双字只记一次：倒排是「双字 → 页」，页内重复次数留给核实阶段数
-      const seen = new Set<number>();
-      for (let at = 0; at + 1 < text.length; at++) {
-        const k = pairKey(text.charCodeAt(at), text.charCodeAt(at + 1));
-        if (k < 0 || seen.has(k)) continue;
-        seen.add(k);
-        const list = postings.get(k);
-        if (list) list.push(fidIdx * PAGE_UNIT + p);
-        else postings.set(k, [fidIdx * PAGE_UNIT + p]);
-      }
+  for (const [p, np] of r.loaded.norm) {
+    const text = np.n;
+    if (text.length < 2) continue;
+    // 同一页同一个双字只记一次：倒排是「双字 → 页」，页内重复次数留给核实阶段数
+    const seen = new Set<number>();
+    for (let at = 0; at + 1 < text.length; at++) {
+      const k = pairKey(text.charCodeAt(at), text.charCodeAt(at + 1));
+      if (k < 0 || seen.has(k)) continue;
+      seen.add(k);
+      const list = postings.get(k);
+      if (list) list.push(fidIdx * PAGE_UNIT + p);
+      else postings.set(k, [fidIdx * PAGE_UNIT + p]);
     }
-    opts.onProgress?.(i + 1, tasks.length);
   }
+  return { fid: task.fid, mtimeMs, pages: r.loaded.pages.size };
+}
 
-  const entries = [...postings.keys()].sort((a, b) => a - b);
+/** 倒排要求升序且不重复：重复会让同一个候选页被核实两次、命中数翻倍。 */
+function dedupeSorted(list: number[]): number[] {
+  list.sort((a, b) => a - b);
+  let at = 0;
+  for (let i = 0; i < list.length; i++) {
+    const v = list[i]!;
+    if (at === 0 || v !== list[at - 1]!) list[at++] = v;
+  }
+  list.length = at;
+  return list;
+}
+
+/**
+ * 把 files + postings 落盘。全量和增量共用这一段：增量不过是带着旧倒排进来，
+ * 少扫几个文件而已，写出来的格式必须完全一样。
+ */
+function writeIndex(
+  dataDir: string,
+  files: IndexedFile[],
+  postings: Map<number, number[]>,
+  pruned: ReadonlySet<number>,
+  dfCap: number,
+): TextIndexMeta {
+  // 剪枝过的双字也要留在字典里：「这个双字存在、但倒排太大」本身就是有用信息
+  const keySet = new Set<number>(postings.keys());
+  for (const k of pruned) keySet.add(k);
+  const entries = [...keySet].sort((a, b) => a - b);
+
   // 每项 12 字节：双字键 / 倒排偏移 / 条数。交错存放，读的时候顺序扫一遍就行。
   const table = Buffer.allocUnsafe(entries.length * 12);
   const chunks: Buffer[] = [];
@@ -194,19 +215,19 @@ export function buildTextIndex(
     const key = entries[i]!;
     const at = i * 12;
     table.writeUInt32LE(key, at);
-    const list = postings.get(key)!;
-    if (list.length > dfCap) {
+    const list = pruned.has(key) ? undefined : postings.get(key);
+    if (!list || list.length > dfCap) {
       table.writeUInt32LE(PRUNED, at + 4);
       table.writeUInt32LE(PRUNED, at + 8);
       prunedBigrams++;
       continue;
     }
-    list.sort((a, b) => a - b);
-    const buf = encodeDeltas(list);
+    const sorted = dedupeSorted(list);
+    const buf = encodeDeltas(sorted);
     table.writeUInt32LE(blobLen, at + 4);
-    table.writeUInt32LE(list.length, at + 8);
+    table.writeUInt32LE(sorted.length, at + 8);
     blobLen += buf.length;
-    postingCount += list.length;
+    postingCount += sorted.length;
     chunks.push(buf);
   }
   const blob = Buffer.concat(chunks, blobLen);
@@ -230,13 +251,203 @@ export function buildTextIndex(
     files,
   };
   writeAtomic(join(dir, 'meta.json'), JSON.stringify(meta));
-  // 全量重建后原来的失效标记就没意义了
+  // 重新落盘后，被登记失效的文件已经重扫过，标记就没意义了
   try {
     writeAtomic(join(dir, 'stale.json'), JSON.stringify({ fids: [] }));
   } catch {
     // 只读目录：索引能用，失效标记删不掉而已
   }
   return meta;
+}
+
+/**
+ * 建索引。输入和检索用同一份任务清单（fid + textRef），文本走 `.text-cache`，
+ * 所以重复构建基本只在拼 postings。
+ */
+export function buildTextIndex(
+  dataDir: string,
+  tasks: TextFileTask[],
+  opts: BuildOptions = {},
+): TextIndexMeta {
+  const files: IndexedFile[] = [];
+  const postings = new Map<number, number[]>();
+  for (let i = 0; i < tasks.length; i++) {
+    const entry = addFileToPostings(dataDir, tasks[i]!, files.length, postings);
+    if (entry) files.push(entry);
+    opts.onProgress?.(i + 1, tasks.length);
+  }
+  return writeIndex(dataDir, files, postings, new Set(), opts.dfCap ?? 20_000);
+}
+
+/* ---------- 增量更新 ---------- */
+
+export interface IndexUpdateStats {
+  /** 语料里新出现、之前没索引过的文件。 */
+  added: number;
+  /** 内容变过（mtime 不符或被标失效）而重做倒排的文件。 */
+  updated: number;
+  /** 已从语料消失、倒排被删掉的文件。 */
+  removed: number;
+  /** 直接沿用旧倒排的文件。 */
+  reused: number;
+  /** 旧索引不可用，整份重建。 */
+  full: boolean;
+  /** 真的写了索引；false 表示什么都没变，一个字节都没动。 */
+  changed: boolean;
+}
+
+export interface IndexUpdateResult {
+  meta: TextIndexMeta;
+  stats: IndexUpdateStats;
+}
+
+interface SyncPlan {
+  /** 旧索引条目下标 → 新索引条目下标。 */
+  remap: Map<number, number>;
+  kept: IndexedFile[];
+  toIndex: TextFileTask[];
+  added: number;
+  updated: number;
+  removed: number;
+}
+
+/**
+ * 比一遍「索引里记的」和「现在磁盘上的」：谁没变（直接复用倒排）、谁变了、
+ * 谁新来、谁走了。只做 stat，不读正文，所以可以随时调用。
+ */
+function planUpdate(index: TextIndex, dataDir: string, tasks: TextFileTask[]): SyncPlan {
+  const now = new Map<string, { task: TextFileTask; mtimeMs: number }>();
+  for (const task of tasks) {
+    const file = resolveTextPath(dataDir, task.textRef);
+    if (!file) continue;
+    const mtimeMs = textFileMtime(file);
+    if (mtimeMs < 0) continue;
+    now.set(task.fid, { task, mtimeMs });
+  }
+
+  const kept: IndexedFile[] = [];
+  const remap = new Map<number, number>();
+  const toIndex: TextFileTask[] = [];
+  let updated = 0;
+  let removed = 0;
+  for (let i = 0; i < index.meta.files.length; i++) {
+    const f = index.meta.files[i]!;
+    const cur = now.get(f.fid);
+    if (!cur) {
+      removed++;
+      continue;
+    }
+    if (index.stale.has(f.fid) || cur.mtimeMs !== f.mtimeMs) {
+      toIndex.push(cur.task);
+      updated++;
+      continue;
+    }
+    remap.set(i, kept.length);
+    kept.push(f);
+  }
+
+  const known = new Set(index.meta.files.map((f) => f.fid));
+  let added = 0;
+  for (const [fid, cur] of now) {
+    if (known.has(fid)) continue;
+    toIndex.push(cur.task);
+    added++;
+  }
+  return { remap, kept, toIndex, added, updated, removed };
+}
+
+/**
+ * 增量更新：只重扫变过/新来的文件，没变的倒排原样搬过来。
+ *
+ * 全量重建要把三千多本的正文过一遍（有 .text-cache 也要拼几十万条 postings），
+ * 识别完一本书就全量重建是不现实的；增量通常只碰几个文件，几十毫秒就完事。
+ * 旧索引不可用（首次、版本不符、文件损坏）时老实退化成全量重建。
+ */
+export function updateTextIndex(
+  dataDir: string,
+  tasks: TextFileTask[],
+  opts: BuildOptions = {},
+): IndexUpdateResult {
+  const prev = loadTextIndex(dataDir);
+  if (!prev) {
+    const meta = buildTextIndex(dataDir, tasks, opts);
+    return {
+      meta,
+      stats: { added: tasks.length, updated: 0, removed: 0, reused: 0, full: true, changed: true },
+    };
+  }
+
+  const plan = planUpdate(prev, dataDir, tasks);
+  const reused = plan.kept.length;
+  if (!plan.toIndex.length && !plan.removed) {
+    return {
+      meta: prev.meta,
+      stats: { added: 0, updated: 0, removed: 0, reused, full: false, changed: false },
+    };
+  }
+
+  // 旧倒排按新下标平移；被删/重做文件的 posting 顺手丢掉
+  const postings = new Map<number, number[]>();
+  const pruned = new Set<number>();
+  for (let i = 0; i < prev.keys.length; i++) {
+    const key = prev.keys[i]!;
+    if (prev.counts[i] === PRUNED) {
+      pruned.add(key);
+      continue;
+    }
+    const list = decodeList(prev, i);
+    const out: number[] = [];
+    for (const v of list) {
+      const nf = plan.remap.get(Math.floor(v / PAGE_UNIT));
+      if (nf === undefined) continue;
+      out.push(nf * PAGE_UNIT + (v % PAGE_UNIT));
+    }
+    if (out.length) postings.set(key, out);
+  }
+
+  const files = plan.kept.slice();
+  for (let j = 0; j < plan.toIndex.length; j++) {
+    const entry = addFileToPostings(dataDir, plan.toIndex[j]!, files.length, postings);
+    if (entry) files.push(entry);
+    opts.onProgress?.(j + 1, plan.toIndex.length);
+  }
+
+  // dfCap 沿用旧索引的设置：中途改阈值会让剪枝范围前后不一致
+  const meta = writeIndex(dataDir, files, postings, pruned, opts.dfCap ?? prev.meta.dfCap);
+  return {
+    meta,
+    stats: { added: plan.added, updated: plan.updated, removed: plan.removed, reused, full: false, changed: true },
+  };
+}
+
+/**
+ * 轻量判断「值不值得跑一次增量」。主进程用它决定要不要起线程：
+ * 只读 meta.json（几百 KB）逐个 stat 文本，不碰几十 MB 的 index.bin。
+ */
+export function textIndexSyncNeeded(dataDir: string, tasks: TextFileTask[]): boolean {
+  if (!tasks.length) return false;
+  const dir = textIndexDir(dataDir);
+  if (!existsSync(join(dir, 'index.bin'))) return true;
+  let meta: TextIndexMeta;
+  try {
+    meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as TextIndexMeta;
+  } catch {
+    return true;
+  }
+  if (meta.version !== VERSION || !Array.isArray(meta.files)) return true;
+  const stale = staleFids(dir);
+  const known = new Map(meta.files.map((f) => [f.fid, f.mtimeMs] as const));
+  let seen = 0;
+  for (const task of tasks) {
+    const file = resolveTextPath(dataDir, task.textRef);
+    if (!file) continue;
+    const mtimeMs = textFileMtime(file);
+    if (mtimeMs < 0) continue;
+    seen++;
+    if (known.get(task.fid) !== mtimeMs || stale.has(task.fid)) return true;
+  }
+  // 条数对不上就说明有文件进/出，交给 planUpdate 去分新增和移除
+  return seen !== meta.files.length;
 }
 
 /* ---------- 加载与查询 ---------- */
@@ -270,7 +481,8 @@ export function loadTextIndex(dataDir: string): TextIndex | null {
   } catch {
     staleStat = null;
   }
-  const key = `${binStat.mtimeMs}:${binStat.size}:${staleStat?.mtimeMs ?? 0}`;
+  // 键里必须带路径：两个数据目录可能在同一毫秒写出同样大小的 index.bin
+  const key = `${binPath}:${binStat.mtimeMs}:${binStat.size}:${staleStat?.mtimeMs ?? 0}`;
   if (cached?.key === key) return cached.index;
 
   let index: TextIndex | null = null;

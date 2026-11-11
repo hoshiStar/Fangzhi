@@ -207,10 +207,18 @@ await check('全文索引面板已打开', `document.getElementById('modal-card'
 await check('全文索引状态可见', `document.getElementById('ti-state').textContent`,
   (v) => /已建/.test(v) || /还没有倒排索引/.test(v));
 await check('全文索引待重建按钮', `!!document.getElementById('ti-build')`, (v) => v === true);
+// 自动同步：默认开着，识别完成/启动/换目录时自动跑增量
+await check('自动同步默认开启', `document.getElementById('ti-auto')?.checked`, (v) => v === true);
+await check('自动同步说明可见', `document.getElementById('ti-sync')?.textContent`, (v) => /自动同步|最近同步/.test(v));
+await check('增量同步按钮就绪', `!!document.getElementById('ti-sync-now')`, (v) => v === true);
 if (process.env.FZ_CDP_BUILD_INDEX === '1') {
   await evaluate(ws, `document.getElementById('ti-build').click()`);
   await waitFor(`/完成：|失败|没有/.test(document.getElementById('ti-msg')?.textContent ?? '')`, 180000);
   await check('全文索引重建完成', `document.getElementById('ti-msg')?.textContent`, (v) => /完成：/.test(v));
+  // 刚建完，紧接着的增量同步应当判定「没有变化」，一个字节都不写
+  await evaluate(ws, `document.getElementById('ti-sync-now').click()`);
+  await waitFor(`/已经是最新|同步完成|失败/.test(document.getElementById('ti-msg')?.textContent ?? '')`, 60000);
+  await check('全量重建后增量同步判定无变化', `document.getElementById('ti-msg')?.textContent`, (v) => /已经是最新/.test(v));
 }
 await evaluate(ws, `document.getElementById('ti-close').click()`);
 await waitFor(`document.getElementById('modal').classList.contains('hidden')`);

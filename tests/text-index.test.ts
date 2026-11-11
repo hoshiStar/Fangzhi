@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   bigramKeys, buildTextIndex, candidatePages, coveredFids, invalidateTextIndexFiles,
-  loadTextIndex, searchTextIndex, textIndexDir,
+  loadTextIndex, searchTextIndex, textIndexDir, textIndexSyncNeeded, updateTextIndex,
 } from '../apps/desktop/src/main/text-index.ts';
+import { createTextIndexBuilder } from '../apps/desktop/src/main/text-index-run.ts';
 import {
   finalizeBooks, loadTextFile, mergeFileHit, normalizeText, scanAllSync, scanLoaded,
 } from '../apps/desktop/src/main/fulltext-core.ts';
@@ -191,4 +192,212 @@ test('双字键忽略代理对，纯生僻字查询退回扫描', () => {
   assert.deepEqual(bigramKeys('赣'), null);
   assert.equal(bigramKeys('赣州')?.length, 1);
   assert.equal(bigramKeys('赣州府志')?.length, 3);
+});
+
+/* ---------- 增量更新 ---------- */
+
+/** 显式把 mtime 往后拨：连续写文件常落在同一毫秒，靠它保证「内容变了」看得出来。 */
+function touchAhead(file: string): void {
+  const t = new Date(Date.now() + 2000);
+  utimesSync(file, t, t);
+}
+
+function addTask(root: string, fid: string, bookId: string, title: string, pages: string[]): TextFileTask {
+  const name = `${fid}.jsonl`;
+  writeFileSync(join(root, 'ocr', name), pages.join('\n'));
+  return { fid, bookId, title, name: `${fid}.pdf`, textRef: `ocr/${name}` };
+}
+
+/** 增量之后，索引给出的结果必须和逐本扫描一致，且一条都不能漏。 */
+function assertSameAsScan(root: string, tasks: TextFileTask[], queries: string[]): void {
+  for (const q of queries) {
+    const scan = scanAllSync(tasks, root, q, 20);
+    const via = searchByIndex(root, tasks, q);
+    assert.equal(via.total, scan.total, `${q} 命中总数不一致`);
+    assert.deepEqual(
+      via.books.map((b) => [b.bookId, b.count, b.files.map((f) => [f.fid, f.count])]),
+      scan.books.map((b) => [b.bookId, b.count, b.files.map((f) => [f.fid, f.count])]),
+      `${q} 书目聚合不一致`,
+    );
+  }
+}
+
+test('增量更新：没有任何变化就一个字节都不写', () => {
+  const { root, tasks } = fixture();
+  try {
+    buildTextIndex(root, tasks);
+    const bin = join(textIndexDir(root), 'index.bin');
+    const before = statSync(bin).mtimeMs;
+    const r = updateTextIndex(root, tasks);
+    assert.equal(r.stats.changed, false);
+    assert.equal(r.stats.reused, 3);
+    assert.equal(r.stats.added + r.stats.updated + r.stats.removed, 0);
+    assert.equal(r.stats.full, false);
+    assert.equal(statSync(bin).mtimeMs, before, '无变化时不该重写 index.bin');
+    assert.equal(textIndexSyncNeeded(root, tasks), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('增量更新：新识别的文件进索引，旧文件倒排沿用', () => {
+  const { root, tasks } = fixture();
+  try {
+    buildTextIndex(root, tasks);
+    const next = [...tasks, addTask(root, 'f-c1', 'book-c', '（乾隆）贛州府志', [
+      page(1, '贛州府志卷四　學校　京師形勝'),
+      page(2, '贛州府志卷五　兵防'),
+    ])];
+    assert.equal(textIndexSyncNeeded(root, next), true);
+
+    const r = updateTextIndex(root, next);
+    assert.equal(r.stats.added, 1);
+    assert.equal(r.stats.updated, 0);
+    assert.equal(r.stats.reused, 3);
+    assert.equal(r.stats.changed, true);
+    assert.equal(r.meta.files.length, 4);
+    assert.equal(loadTextIndex(root)!.meta.files.length, 4);
+    assertSameAsScan(root, next, ['赣州府志', '京师', '吉水', '学校']);
+    assert.equal(textIndexSyncNeeded(root, next), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('增量更新：改过的文件重做倒排并清掉失效标记', () => {
+  const { root, tasks } = fixture();
+  try {
+    buildTextIndex(root, tasks);
+    assert.equal(coveredFids(loadTextIndex(root)!).size, 3);
+
+    // 模拟 OCR 重跑：内容变了（mtime 变）+ 已经被登记失效
+    const p = join(root, 'ocr', 'f-b1.jsonl');
+    writeFileSync(p, [page(1, '吉水縣志　贛州府志未載'), page(2, '贛州府志　補遺　學校')].join('\n'));
+    touchAhead(p);
+    invalidateTextIndexFiles(root, ['f-b1']);
+
+    const r = updateTextIndex(root, tasks);
+    assert.equal(r.stats.updated, 1);
+    assert.equal(r.stats.reused, 2);
+    assert.equal(r.meta.files.length, 3);
+
+    const index = loadTextIndex(root)!;
+    assert.equal(index.stale.size, 0, '重扫过就不该再挂失效标记');
+    assert.equal(coveredFids(index).size, 3);
+    // 新页必须已经在倒排里，而不是靠「未覆盖整篇重扫」兜着
+    const cand = candidatePages(index, normalizeText('补遗'))!;
+    assert.ok([...cand.values()].flat().includes(2));
+    assertSameAsScan(root, tasks, ['赣州府志', '补遗', '吉水']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('增量更新：语料里已经删掉的文件从索引中移除', () => {
+  const { root, tasks } = fixture();
+  try {
+    buildTextIndex(root, tasks);
+    const next = tasks.filter((t) => t.fid !== 'f-a2');
+    const r = updateTextIndex(root, next);
+    assert.equal(r.stats.removed, 1);
+    assert.equal(r.stats.reused, 2);
+    assert.equal(r.meta.files.length, 2);
+    assert.deepEqual(r.meta.files.map((f) => f.fid), ['f-a1', 'f-b1']);
+    // 「山川」只在被删掉的那一页里
+    assertSameAsScan(root, next, ['山川', '赣州府志', '吉水']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('增量结果与重新全量建索引等价', () => {
+  const { root, tasks } = fixture();
+  try {
+    buildTextIndex(root, tasks);
+    const next = [...tasks, addTask(root, 'f-c1', 'book-c', '（乾隆）贛州府志', [
+      page(1, '贛州府志卷四　學校　京師形勝　贛江'),
+    ])];
+    const inc = updateTextIndex(root, next).meta;
+    assertSameAsScan(root, next, ['赣州府志', '京师', '吉水', '赣江']);
+
+    const full = buildTextIndex(root, next);
+    assert.equal(inc.bigramCount, full.bigramCount, '双字字典应与全量一致');
+    assert.equal(inc.prunedBigrams, full.prunedBigrams);
+    assert.equal(inc.postingCount, full.postingCount, '倒排条数应与全量一致');
+    assert.deepEqual(inc.files.map((f) => [f.fid, f.pages]), full.files.map((f) => [f.fid, f.pages]));
+    assertSameAsScan(root, next, ['赣州府志', '京师', '吉水', '赣江']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('没有旧索引时增量退化成全量重建', () => {
+  const { root, tasks } = fixture();
+  try {
+    const r = updateTextIndex(root, tasks);
+    assert.equal(r.stats.full, true);
+    assert.equal(r.stats.changed, true);
+    assert.equal(r.meta.files.length, 3);
+    assertSameAsScan(root, tasks, ['赣州府志']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('同步预检：不读 index.bin 也能判断该不该同步', () => {
+  const { root, tasks } = fixture();
+  try {
+    assert.equal(textIndexSyncNeeded(root, []), false, '没有 OCR 文本就不该动索引');
+    assert.equal(textIndexSyncNeeded(root, tasks), true, '没有索引就该建');
+
+    buildTextIndex(root, tasks);
+    assert.equal(textIndexSyncNeeded(root, tasks), false);
+
+    // 标了失效 → 需要同步
+    invalidateTextIndexFiles(root, ['f-a1']);
+    assert.equal(textIndexSyncNeeded(root, tasks), true);
+    updateTextIndex(root, tasks);
+    assert.equal(textIndexSyncNeeded(root, tasks), false, '同步完就不该再报需要同步');
+
+    // 文件条数变了（多一个）
+    const next = [...tasks, addTask(root, 'f-e1', 'book-e', '（同治）贛州府志', [page(1, '贛州府志　雜記')])];
+    assert.equal(textIndexSyncNeeded(root, next), true);
+
+    // mtime 变了
+    const p = join(root, 'ocr', 'f-a1.jsonl');
+    touchAhead(p);
+    assert.equal(textIndexSyncNeeded(root, tasks), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('索引构建门面：update 在没有 worker 文件时同步跑完并给出 stats', async () => {
+  const { root, tasks } = fixture();
+  try {
+    buildTextIndex(root, tasks);
+    const builder = createTextIndexBuilder({
+      tasks: () => tasks,
+      dataDir: () => root,
+      // 指一个不存在的 worker：走同步退路，正好覆盖打包漏文件的情况
+      workerFile: join(root, 'no-such-worker.cjs'),
+    });
+    const r = await builder.update();
+    assert.equal(r.ok, true);
+    assert.equal(r.stats?.changed, false);
+    assert.equal(builder.running(), false);
+
+    const next = [...tasks, addTask(root, 'f-d1', 'book-d', '（道光）贛州府志', [page(1, '贛州府志　藝文')])];
+    const builder2 = createTextIndexBuilder({
+      tasks: () => next,
+      dataDir: () => root,
+      workerFile: join(root, 'no-such-worker.cjs'),
+    });
+    const r2 = await builder2.update();
+    assert.equal(r2.ok, true);
+    assert.equal(r2.stats?.added, 1);
+    assertSameAsScan(root, next, ['赣州府志']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -10,7 +10,7 @@
 
 ## 会改写本地数据
 
-- `build-text-index.ts`：建全文倒排索引到 `<数据目录>/.text-index/`（只读 `index.full.json`，不改它）。`npm run build:text-index` 即可；`FZ_DF_CAP` 可收紧高频双字剪枝阈值。
+- `build-text-index.ts`：建全文倒排索引到 `<数据目录>/.text-index/`（只读 `index.full.json`，不改它）。`npm run build:text-index` 全量建；加 `-- --update` 只重扫变过/新来的文件（桌面端「识别完自动同步」走同一条路）；`FZ_DF_CAP` 可收紧高频双字剪枝阈值。
 - `verify-index.ts`：会重写 `data/index.full.json` 和 `index.lean.json`，必须显式加 `--write`。
 - `tools/ocr/ocr.py`：会写 `data/ocr/*.jsonl` 并回写索引，使用前先备份索引。
 - `tools/gen-t2s.mjs`：重写 `packages/core/src/t2s.ts`（繁简单字映射表），只有升级 opencc 词典时才需要跑。

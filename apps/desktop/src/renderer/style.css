@@ -340,6 +340,9 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
 .modal .msg { font-size: 12px; }
 .modal .msg.ok { color: var(--ok); }
 .modal .msg.err { color: var(--err); }
+/* 自动同步开关：文字跟着复选框走，别让 label 撑成一整行 */
+.modal .ti-auto { font-size: 12px; color: var(--fg-dim); cursor: pointer; }
+.modal .ti-auto input { margin: 0; accent-color: var(--accent); }
 .modal .editgrid {
   display: grid;
   grid-template-columns: 1fr 1fr;

@@ -40,10 +40,17 @@ const api = {
   ocrSummary: () => ipcRenderer.invoke('ocr-summary'),
   textIndexStatus: () => ipcRenderer.invoke('text-index-status'),
   buildTextIndex: () => ipcRenderer.invoke('text-index-build'),
+  syncTextIndex: () => ipcRenderer.invoke('text-index-sync'),
+  setTextIndexAuto: (on: boolean) => ipcRenderer.invoke('text-index-set-auto', on),
   onTextIndexProgress: (cb: (p: unknown) => void) => {
     const h = (_e: unknown, p: unknown) => cb(p);
     ipcRenderer.on('text-index-progress', h);
     return () => ipcRenderer.removeListener('text-index-progress', h);
+  },
+  onTextIndexAuto: (cb: (p: unknown) => void) => {
+    const h = (_e: unknown, p: unknown) => cb(p);
+    ipcRenderer.on('text-index-auto', h);
+    return () => ipcRenderer.removeListener('text-index-auto', h);
   },
   openOcrFolder: () => ipcRenderer.invoke('open-ocr-folder'),
   ocrRunnerStatus: () => ipcRenderer.invoke('ocr-runner-status'),

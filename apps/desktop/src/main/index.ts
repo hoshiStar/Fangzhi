@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, renameSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, renameSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import {
   applyBookOverrides, buildIndex, computeFacets, countSearchableBooks,
@@ -22,7 +22,8 @@ import { createFulltextSearch } from './fulltext.ts';
 import type { TextFileTask } from './fulltext-core.ts';
 import { createOcrRunner } from './ocr-runner.ts';
 import { createTextIndexBuilder } from './text-index-run.ts';
-import { invalidateTextIndexFiles, loadTextIndex } from './text-index.ts';
+import { invalidateTextIndexFiles, loadTextIndex, textIndexSyncNeeded } from './text-index.ts';
+import type { IndexUpdateStats } from './text-index.ts';
 import { createLibrary } from './library.ts';
 
 // 自动化检查必须使用独立用户目录，避免碰真实 cookie、下载清单和校正记录。
@@ -65,7 +66,7 @@ let downloads: DownloadManager;
 let ocrRunner: ReturnType<typeof createOcrRunner>;
 let library: ReturnType<typeof createLibrary>;
 let bookOverrides: BookOverrideFile = emptyBookOverrides();
-let settings: { downloadDir: string; dataDir?: string } = { downloadDir: '' };
+let settings: { downloadDir: string; dataDir?: string; autoTextIndex?: boolean } = { downloadDir: '' };
 
 function settingsPath(): string { return join(app.getPath('userData'), 'settings.json'); }
 function overridesPath(): string { return join(app.getPath('userData'), 'book-overrides.json'); }
@@ -94,6 +95,8 @@ function loadSettings(): void {
   // 默认落在系统「下载」文件夹下的独立子目录：用户找得到，开发版和打包版也共用同一处，
   // 不会因为 app name 不同（@fangzhi/desktop vs 方志检索）各存一份、互相看不见。
   if (!settings.downloadDir) settings.downloadDir = join(app.getPath('downloads'), '方志检索');
+  // 默认开着：索引不跟着识别更新的话，新书就只能整篇扫描，越用越慢
+  if (settings.autoTextIndex === undefined) settings.autoTextIndex = true;
 }
 
 function saveSettings(): void { writeFileSync(settingsPath(), JSON.stringify(settings, null, 2)); }
@@ -193,6 +196,92 @@ const textIndexBuilder = createTextIndexBuilder({
   dataDir: () => dataDir,
   onProgress: (p) => send('text-index-progress', p),
 });
+
+/**
+ * 索引自动同步：识别完一批、程序启动、换数据目录时各跑一次增量更新。
+ *
+ * 以前识别完只把文件标成「失效」——检索结果仍然是对的，但新书永远走整篇扫描，
+ * 索引实际上再也不会更新；指望用户想起来点「重建索引」不现实，而全量重建要几十秒。
+ * 增量只重扫变过的文件，所以可以跟着识别直接跑。
+ */
+let indexSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let indexSyncBusy = false;
+let lastIndexSync: {
+  at: string;
+  reason: string;
+  ok: boolean;
+  stats?: IndexUpdateStats;
+  error?: string;
+} | null = null;
+
+interface SyncOutcome {
+  ok: boolean;
+  changed: boolean;
+  busy?: boolean;
+  stats?: IndexUpdateStats;
+  error?: string;
+}
+
+/** 数据目录能不能写。打包版装在 Program Files 下时索引是只读的，这时同步直接跳过。 */
+function dataDirWritable(): boolean {
+  try {
+    accessSync(dataDir, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 识别进程在跑时不碰索引：它一边写 jsonl 一边回写 index.full.json，扫到半份没意义。 */
+let ocrRunning = false;
+
+function scheduleTextIndexSync(reason: string, delayMs = 3000): void {
+  if (settings.autoTextIndex === false) return;
+  if (indexSyncTimer) clearTimeout(indexSyncTimer);
+  indexSyncTimer = setTimeout(() => {
+    indexSyncTimer = null;
+    void runTextIndexSync(reason);
+  }, delayMs);
+}
+
+async function runTextIndexSync(reason: string): Promise<SyncOutcome> {
+  // 打包版的数据目录常在 resources 下，装到 Program Files 就只读了：索引随安装包走，
+  // 别每启动一次就报一次写盘失败
+  if (!dataDirWritable()) return { ok: true, changed: false };
+  if (indexSyncBusy || textIndexBuilder.running()) {
+    // 有任务在跑（用户点了全量重建，或上一轮同步还没完）：等它结束再补一次，
+    // 否则这期间新识别的文件就漏在索引外面了
+    scheduleTextIndexSync(reason, 5000);
+    return { ok: true, changed: false, busy: true };
+  }
+  // 先做一遍只 stat 的比较：什么都没变就不起线程、不写盘
+  if (ocrRunning) {
+    scheduleTextIndexSync(reason, 10_000);
+    return { ok: true, changed: false, busy: true };
+  }
+  if (!textIndexSyncNeeded(dataDir, ocrTextTasks())) return { ok: true, changed: false };
+  indexSyncBusy = true;
+  send('text-index-auto', { state: 'start', reason });
+  try {
+    const r = await textIndexBuilder.update();
+    lastIndexSync = {
+      at: new Date().toISOString(),
+      reason,
+      ok: r.ok,
+      stats: r.stats,
+      error: r.error,
+    };
+    send('text-index-auto', { state: r.ok ? 'done' : 'error', reason, meta: r.meta, stats: r.stats, error: r.error });
+    return { ok: r.ok, changed: !!r.stats?.changed, stats: r.stats, error: r.error };
+  } catch (e) {
+    const error = (e as Error).message;
+    lastIndexSync = { at: new Date().toISOString(), reason, ok: false, error };
+    send('text-index-auto', { state: 'error', reason, error });
+    return { ok: false, changed: false, error };
+  } finally {
+    indexSyncBusy = false;
+  }
+}
 
 /**
  * 识别脚本位置。开发版在仓库里；打包版随 resources 一起发（见 package-portable.mjs）。
@@ -357,6 +446,8 @@ function registerIpc(): void {
     applyBookOverrides(idx, bookOverrides);
     settings.dataDir = dir;
     saveSettings();
+    // 换了语料就重新比一遍：新目录可能带着旧索引，也可能压根没有索引要建
+    scheduleTextIndexSync('data-dir', 1200);
     return { ok: true, dataDir, stats: idx.stats, meta: idx.meta, crawledAt: idx.crawledAt };
   });
 
@@ -428,6 +519,9 @@ function registerIpc(): void {
       meta: i?.meta ?? null,
       stale: i ? [...i.stale] : [],
       textFiles: (idx?.files ?? []).filter((f) => !!f.textRef).length,
+      auto: settings.autoTextIndex !== false,
+      syncing: indexSyncBusy || textIndexBuilder.running(),
+      lastSync: lastIndexSync,
       bytes: (() => {
         try {
           return statSync(join(dataDir, '.text-index', 'index.bin')).size;
@@ -438,6 +532,21 @@ function registerIpc(): void {
     };
   });
   ipcMain.handle('text-index-build', () => textIndexBuilder.build());
+  /** 自动同步开关：关掉就不再跟着识别更新，只能手动重建。 */
+  ipcMain.handle('text-index-set-auto', (_e, on: boolean) => {
+    settings.autoTextIndex = !!on;
+    saveSettings();
+    if (settings.autoTextIndex) scheduleTextIndexSync('toggle', 800);
+    return { auto: settings.autoTextIndex };
+  });
+  /** 手动触发一次增量，给界面上「立即同步」用。 */
+  ipcMain.handle('text-index-sync', () => {
+    if (indexSyncTimer) {
+      clearTimeout(indexSyncTimer);
+      indexSyncTimer = null;
+    }
+    return runTextIndexSync('manual');
+  });
   ipcMain.handle('ocr-summary', () => {
     const files = idx?.files ?? [];
     return {
@@ -526,14 +635,19 @@ app.whenReady().then(() => {
     cwd: () => resolveOcrScript().cwd,
     dataDir: () => dataDir,
     downloadDir: () => settings.downloadDir,
-    onProgress: (s) => send('ocr-progress', s),
+    onProgress: (s) => {
+      ocrRunning = s.status === 'running';
+      send('ocr-progress', s);
+    },
     onFinished: (ok, note) => {
+      ocrRunning = false;
       if (ok) {
         reloadIndexFromDisk();
-        // 新识别的文本还没进倒排索引：登记失效，检索时按未覆盖整篇重扫，
-        // 不必为了这一本书重建全量索引（重建可以从「工具 → 全文索引」手动触发）。
+        // 新识别的文本还没进倒排索引：先登记失效，保证随后立刻发起的检索也是对的
+        // （失效文件会被整篇重扫），再排一次增量更新把倒排补齐。
         const done = ocrRunner?.doneFids?.() ?? [];
         if (done.length) invalidateTextIndexFiles(dataDir, done);
+        scheduleTextIndexSync('ocr');
       }
       send('ocr-done', { ok, note });
     },
@@ -543,6 +657,8 @@ app.whenReady().then(() => {
   registerReader(readerDeps());
   createWindow();
   if (!r.ok) dialog.showErrorBox('索引未就绪', r.error ?? '');
+  // 启动时补一次：上次识别完还没来得及同步就退出了，这里补上增量
+  scheduleTextIndexSync('startup', 5000);
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
   // worker 线程不会自己退出，退出前显式收掉，避免残留进程
