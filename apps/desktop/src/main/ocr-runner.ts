@@ -98,6 +98,8 @@ function probe(cmd: string, args: string[], timeoutMs: number, env?: NodeJS.Proc
 export function createOcrRunner(deps: OcrRunnerDeps) {
   let state: OcrJobState = idleState();
   let child: ReturnType<typeof spawn> | null = null;
+  /** 本轮真的产出过文本的 fid：主进程据此把倒排索引里对应的条目标失效。 */
+  let doneFileIds = new Set<string>();
   let cached: { runtime: OcrRuntime; cmd: string; args: string[]; note: string; at: number } | null = null;
 
   const emit = (): void => deps.onProgress({ ...state, log: [...state.log] });
@@ -169,6 +171,8 @@ export function createOcrRunner(deps: OcrRunnerDeps) {
       // 收尾行形如「-> ocr/<fid>.jsonl（v6s，本次 3 页，全本 80 页，状态 pending）」。
       // 只有状态是 done 才算整本完成——限页冒烟时这本书仍然是 pending。
       if (/状态\s*done/.test(t)) state.doneFiles += 1;
+      const m2 = /^-> ocr\/([\w.-]+)\.jsonl/.exec(t);
+      if (m2) doneFileIds.add(m2[1]!);
       return;
     }
   }
@@ -197,6 +201,7 @@ export function createOcrRunner(deps: OcrRunnerDeps) {
       if (opts.vertical) args.push('--vertical', opts.vertical);
       if (opts.force) args.push('--force');
 
+      doneFileIds = new Set<string>();
       state = {
         ...idleState(), status: 'running', runtime: d.runtime,
         startedAt: Date.now(),
@@ -247,6 +252,11 @@ export function createOcrRunner(deps: OcrRunnerDeps) {
       });
 
       return { ok: true as const };
+    },
+
+    /** 本轮写出过 OCR 文本的 fid（含限页冒烟、也含重跑）。 */
+    doneFids(): string[] {
+      return [...doneFileIds];
     },
 
     cancel() {

@@ -38,6 +38,13 @@ const api = {
     return () => ipcRenderer.removeListener('search-text-progress', h);
   },
   ocrSummary: () => ipcRenderer.invoke('ocr-summary'),
+  textIndexStatus: () => ipcRenderer.invoke('text-index-status'),
+  buildTextIndex: () => ipcRenderer.invoke('text-index-build'),
+  onTextIndexProgress: (cb: (p: unknown) => void) => {
+    const h = (_e: unknown, p: unknown) => cb(p);
+    ipcRenderer.on('text-index-progress', h);
+    return () => ipcRenderer.removeListener('text-index-progress', h);
+  },
   openOcrFolder: () => ipcRenderer.invoke('open-ocr-folder'),
   ocrRunnerStatus: () => ipcRenderer.invoke('ocr-runner-status'),
   ocrRunnerStart: (opts: { limit?: number; maxPages?: number; force?: boolean; fids?: string[] }) =>

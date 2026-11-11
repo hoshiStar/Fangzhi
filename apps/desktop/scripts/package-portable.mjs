@@ -46,8 +46,16 @@ cpSync(src, join(data, 'index.full.json'));
 const meta = join(repo, 'data', 'meta.json');
 if (existsSync(meta)) cpSync(meta, join(data, 'meta.json'));
 // OCR 文本目录（tools/ocr/ocr.py 的产出），没有就不拷，阅读器会自己降级成只读 PDF
+// OCR 文本与倒排索引都按 (源文件 mtime) 判有效期，拷贝必须保留时间戳，
+// 否则包内索引一装就全部判过期，等于白带。
 const ocrDir = join(repo, 'data', 'ocr');
-if (existsSync(ocrDir)) cpSync(ocrDir, join(data, 'ocr'), { recursive: true });
+if (existsSync(ocrDir)) cpSync(ocrDir, join(data, 'ocr'), { recursive: true, preserveTimestamps: true });
+// 倒排索引随包发：打包版数据目录通常不可写，运行时没法自己重建
+const textIndex = join(repo, 'data', '.text-index');
+if (existsSync(textIndex)) cpSync(textIndex, join(data, '.text-index'), { recursive: true, preserveTimestamps: true });
+// 检索缓存同理：跟 OCR 一起带走，首次检索不用重新解析
+const textCache = join(repo, 'data', '.text-cache');
+if (existsSync(textCache)) cpSync(textCache, join(data, '.text-cache'), { recursive: true, preserveTimestamps: true });
 
 // 识别脚本随包发：桌面端「全文识别」要能直接拉起子进程。
 // 模型（tools/ocr/models）几十 MB 且首次使用才下载，不打进包里。

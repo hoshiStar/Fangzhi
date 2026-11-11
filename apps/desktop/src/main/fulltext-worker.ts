@@ -4,6 +4,7 @@ import {
   rememberMask, resolveTextPath, scanLoaded, textCachePath, textFileMtime,
 } from './fulltext-core.ts';
 import type { LoadedText, TextBookHit, TextFileTask } from './fulltext-core.ts';
+import { loadTextIndex, searchTextIndex } from './text-index.ts';
 
 /**
  * 全库全文检索的独立线程。
@@ -32,6 +33,10 @@ interface ScanStats {
   cached: number;
   parsed: number;
   skipped: number;
+  /** 1 = 这一轮走了倒排索引 */
+  indexed: number;
+  /** 倒排给出的候选文件数，只用于诊断 */
+  candidates?: number;
 }
 
 const cache = new Map<string, { mtimeMs: number; loaded: LoadedText }>();
@@ -110,14 +115,45 @@ async function runJob(job: Job): Promise<void> {
   // 每 8 个文件让出一次事件循环：取消消息才进得来，进度也不会几秒才跳一下
   const yieldEvery = 8;
   // 这一轮多少文件走了磁盘缓存、多少重新解析过、多少被位图直接排除，供诊断脚本核对
-  const stats: ScanStats = { cached: 0, parsed: 0, skipped: 0 };
+  const stats: ScanStats = { cached: 0, parsed: 0, skipped: 0, indexed: 0 };
+
+  // 先试倒排索引：候选页定下来后只需要核实这几页，其余文件一律不用读
+  let covered: Set<string> | null = null;
+  const index = loadTextIndex(job.dataDir);
+  if (index) {
+    const r = searchTextIndex(index, job.dataDir, job.files, needle, {
+      shouldStop: () => canceled.has(job.id),
+      onProgress: (done, candTotal) => parentPort?.postMessage({
+        type: 'progress', id: job.id, scanned: done, total: candTotal,
+      }),
+    });
+    if (r) {
+      stats.indexed = 1;
+      stats.candidates = r.candidates;
+      covered = r.covered;
+      for (const h of r.hits) {
+        if (h.fromCache) stats.cached++;
+        else stats.parsed++;
+        total += h.count;
+        mergeFileHit(books, h.task, h.loaded, h.hits, h.count, needle);
+      }
+      if (r.stopped) {
+        canceled.delete(job.id);
+        parentPort?.postMessage({ type: 'done', id: job.id, result: { total: 0, books: [], canceled: true } });
+        return;
+      }
+    }
+  }
+
   for (let i = 0; i < job.files.length; i++) {
+    const task = job.files[i]!;
+    // 索引已经证明这份文本不含查询字，连缓存头都不用看
+    if (covered?.has(task.fid)) continue;
     if (canceled.has(job.id)) {
       canceled.delete(job.id);
       parentPort?.postMessage({ type: 'done', id: job.id, result: { total: 0, books: [], canceled: true } });
       return;
     }
-    const task = job.files[i]!;
     const loaded = takeFromCache(job.dataDir, task, needle, stats);
     if (loaded) {
       const { hits, count } = scanLoaded(loaded, needle);

@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, renameSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import {
   applyBookOverrides, buildIndex, computeFacets, countSearchableBooks,
@@ -21,6 +21,8 @@ import { createOcrReader } from './ocr.ts';
 import { createFulltextSearch } from './fulltext.ts';
 import type { TextFileTask } from './fulltext-core.ts';
 import { createOcrRunner } from './ocr-runner.ts';
+import { createTextIndexBuilder } from './text-index-run.ts';
+import { invalidateTextIndexFiles, loadTextIndex } from './text-index.ts';
 import { createLibrary } from './library.ts';
 
 // 自动化检查必须使用独立用户目录，避免碰真实 cookie、下载清单和校正记录。
@@ -156,30 +158,40 @@ const readerDeps = (): ReaderDeps => ({
 /** OCR 文本读取，延迟取值同上。 */
 const ocr = createOcrReader({ index: () => idx, dataDir: () => dataDir });
 
+/** 索引里所有带 OCR 文本的文件；全文检索和倒排索引构建共用同一份清单。 */
+function ocrTextTasks(): TextFileTask[] {
+  const i = idx;
+  if (!i) return [];
+  const titles = new Map(i.books.map((b) => [b.id, b.title] as const));
+  const out: TextFileTask[] = [];
+  for (const f of i.files) {
+    if (!f.textRef) continue;
+    out.push({
+      fid: f.fid,
+      bookId: f.bookId,
+      title: titles.get(f.bookId) ?? f.bookId,
+      name: f.name,
+      textRef: f.textRef,
+    });
+  }
+  return out;
+}
+
 /**
  * 全库全文检索跑在 worker 线程里。传给线程的只有 fid / 书名 / textRef，
  * 不带整份索引；界面不会被上千个 jsonl 的解析和繁简归一化卡住。
  */
 const fulltext = createFulltextSearch({
-  tasks: (): TextFileTask[] => {
-    const i = idx;
-    if (!i) return [];
-    const titles = new Map(i.books.map((b) => [b.id, b.title] as const));
-    const out: TextFileTask[] = [];
-    for (const f of i.files) {
-      if (!f.textRef) continue;
-      out.push({
-        fid: f.fid,
-        bookId: f.bookId,
-        title: titles.get(f.bookId) ?? f.bookId,
-        name: f.name,
-        textRef: f.textRef,
-      });
-    }
-    return out;
-  },
+  tasks: ocrTextTasks,
   dataDir: () => dataDir,
   onProgress: (p) => send('search-text-progress', p),
+});
+
+/** 倒排索引构建：同样放线程里跑，构建上千本时要几十秒，不能占住界面。 */
+const textIndexBuilder = createTextIndexBuilder({
+  tasks: ocrTextTasks,
+  dataDir: () => dataDir,
+  onProgress: (p) => send('text-index-progress', p),
 });
 
 /**
@@ -408,6 +420,24 @@ function registerIpc(): void {
   ipcMain.handle('ocr-search', (_e, fid: string, q: string) => ocr.search(fid, q));
   // 全库全文检索走独立线程；同一时间只跑一条，新查询顶掉旧查询。
   ipcMain.handle('search-text', (_e, q: string) => fulltext.search(q));
+  /** 倒排索引：状态用于界面展示，重建放线程里跑并推进度。 */
+  ipcMain.handle('text-index-status', () => {
+    const i = loadTextIndex(dataDir);
+    return {
+      built: !!i,
+      meta: i?.meta ?? null,
+      stale: i ? [...i.stale] : [],
+      textFiles: (idx?.files ?? []).filter((f) => !!f.textRef).length,
+      bytes: (() => {
+        try {
+          return statSync(join(dataDir, '.text-index', 'index.bin')).size;
+        } catch {
+          return 0;
+        }
+      })(),
+    };
+  });
+  ipcMain.handle('text-index-build', () => textIndexBuilder.build());
   ipcMain.handle('ocr-summary', () => {
     const files = idx?.files ?? [];
     return {
@@ -498,7 +528,13 @@ app.whenReady().then(() => {
     downloadDir: () => settings.downloadDir,
     onProgress: (s) => send('ocr-progress', s),
     onFinished: (ok, note) => {
-      if (ok) reloadIndexFromDisk();
+      if (ok) {
+        reloadIndexFromDisk();
+        // 新识别的文本还没进倒排索引：登记失效，检索时按未覆盖整篇重扫，
+        // 不必为了这一本书重建全量索引（重建可以从「工具 → 全文索引」手动触发）。
+        const done = ocrRunner?.doneFids?.() ?? [];
+        if (done.length) invalidateTextIndexFiles(dataDir, done);
+      }
       send('ocr-done', { ok, note });
     },
   });

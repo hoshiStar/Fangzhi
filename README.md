@@ -45,6 +45,7 @@ npm run dev --workspace @fangzhi/desktop
 | `npm run typecheck` | 检查核心库类型 |
 | `npm run typecheck --workspace @fangzhi/desktop` | 检查桌面端类型 |
 | `npm test` | 运行核心、跨端一致性和下载路径测试 |
+| `npm run build:text-index` | 建全文倒排索引到 `data/.text-index/`（`FZ_DF_CAP` 可收紧高频双字剪枝） |
 | `npm run verify` | 类型检查 + 自动测试 + 小程序冒烟 |
 | `npm run build --workspace @fangzhi/desktop` | 构建桌面端 `dist/` |
 | `npm run package --workspace @fangzhi/desktop` | 构建 Windows 便携版并生成数据清单 |
@@ -105,7 +106,7 @@ uv run tools/ocr/ocr.py --dir "下载目录" --fids <fid1>,<fid2>   # 只识别�
 - `verify-index.ts`：会覆盖索引，必须显式加 `--write`。
 - `verify-crawl-resume.ts`：会真实联网爬取，必须显式加 `--run`。
 - `tools/cdp-probe.mjs`：默认只读界面检查；账号/下载写操作需要显式环境变量和隔离 profile。
-- `tools/check-fulltext-worker.mjs`：用临时数据目录直接起全文检索 worker，验证聚合、进度、取消、位图预筛跳过，以及换一个 worker 后是否全部命中磁盘缓存；需要先 `npm run build:desktop`。
+- `tools/check-fulltext-worker.mjs`：用临时数据目录直接起全文检索 worker，验证聚合、进度、取消、位图预筛跳过、换一个 worker 后是否全部命中磁盘缓存，以及建倒排索引后是否真的走索引并与扫描结果一致；需要先 `npm run build:desktop`。
 - 使用隔离 profile 启动桌面端：
 
 ```bash
@@ -119,14 +120,17 @@ FZ_USER_DATA_DIR=.tmp/cdp-profile npx electron apps/desktop --remote-debugging-p
 1. 复制当前 `dist/`；
 2. 复制当前 `data/index.full.json`、`meta.json` 和全部 OCR 数据；
 3. 生成 `resources/data/data-manifest.json`，包含应用版本、索引哈希、OCR 文件数和统计信息；
-4. 生成 `release/portable-win-x64/方志检索.exe`。装配先写临时目录再整体替换；若旧目录正被杀软或残留进程占用，会退让成 `portable-win-x64-<时间戳>/` 并打印提示，关掉占用者后下次正常覆盖。
+4. 把 `data/.text-index/` 一起拷进包（打包版数据目录通常不可写，运行时无法自建）；
+5. 生成 `release/portable-win-x64/方志检索.exe`。装配先写临时目录再整体替换；若旧目录正被杀软或残留进程占用，会退让成 `portable-win-x64-<时间戳>/` 并打印提示，关掉占用者后下次正常覆盖。
 
 发布前应执行 `npm run verify`，并核对数据清单中的 OCR 引用数与实际文件数。
 
 ## 当前已知限制
 
 - 全库全文检索在独立 worker 线程里跑，界面不会被上千个 JSONL 的解析卡住。检索前先看每个文件缓存头里的**字符位图**（正文出现过哪些字），查询里的字一个都没有就直接跳过，正文一个字节都不读；位图本身也常驻内存，同一线程内二次查询不再发系统调用。实测 300 本 × 120 页样本，稀见词查询 1.9s → 0.11s（二次 0.08s）。
-- 真正命中还是要逐本比对正文，所以上千本全量命中仍是秒级而非瞬时；要彻底解决得落倒排索引（词 → fid/页），代价是索引体积随语料线性涨，暂未做。
+- 另有**双字倒排索引**（`npm run build:text-index`，或界面「工具 → 全文索引」重建）：把「双字 → 页码」预存到 `<数据目录>/.text-index/`，查询时先求交定候选页，再回正文核实，不再逐本读正文。实测 300 本 × 120 页样本，稀见词查询 0.76s → 0.014s；同语料下索引与全量扫描的结果逐本逐页一致。
+- 倒排索引会剪掉太常见的双字（默认单个双字超过 2 万条倒排就不存）：`县志`、`府志` 这类高频双字查询仍然退回扫描，「赣州府志」这类带低频双字的照常走索引。索引不自动构建——识别出新文本后检索会把这些文件按「未覆盖」整篇扫描，结果仍是全的，只是慢；等积累几本再重建即可。
+- 索引体积随语料线性增长（本机 10 个文件约 0.12 MB；粗估每 100 万页量级在数百 MB），构建时 postings 全在内存里拼，超大语料需要分批或落磁盘。
 - 识别模型首次使用需联网下载（约 100 MB），应用内还没有下载进度提示。
 - 查询没有做分词：连写（「嘉慶贛州府志」）靠去标点的紧凑串和「书名被查询包含」反向命中，中间夹错字时仍只会落到「近似」一档。
 - 小程序仍需真实 AppID、真机验收和发布流程。

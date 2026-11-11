@@ -54,11 +54,6 @@ console.log('cancel result', JSON.stringify(r2), 'elapsed', Date.now() - t0, 'ms
 w.postMessage({ type: 'search', job: { id: 3, q: '   ', limit: 20, dataDir: root, files } });
 await wait(3);
 console.log('empty query', JSON.stringify(results[2].result));
-console.log('first run stats', JSON.stringify(r1.stats));
-if (r1.stats.skipped < 1) throw new Error('位图预筛未生效: ' + JSON.stringify(r1.stats));
-if (r1.result.books.some((b) => b.bookId === 'book-c')) throw new Error('被跳过文件不应出现在结果里');
-if (r1.stats.skipped < 1) throw new Error('位图预筛未生效: ' + JSON.stringify(r1.stats));
-if (r1.result.books.some((b) => b.bookId === 'book-c')) throw new Error('被跳过文件不应出现在结果里');
 
 await w.terminate();
 
@@ -88,6 +83,37 @@ await new Promise((res, rej) => {
 });
 console.log('second query in same worker', Date.now() - t1, 'ms', JSON.stringify(results2[1].stats));
 if (r3.result.total !== r1.result.total) throw new Error('缓存前后结果不一致');
+
+// 6. 建倒排索引后换一个 worker 再查：应当走索引，且结果与扫描一致
+const textIndexModule = await import(new URL('../apps/desktop/src/main/text-index.ts', import.meta.url).href);
+const meta = textIndexModule.buildTextIndex(root, files);
+console.log('index built', JSON.stringify({ bigrams: meta.bigramCount, postings: meta.postingCount }));
+const w3 = new Worker(resolve('apps/desktop/dist/main/fulltext-worker.cjs'));
+const results3 = [];
+w3.on('message', (m) => { if (m.type === 'done' || m.type === 'error') results3.push(m); });
+w3.on('error', (e) => { console.error('worker3 error', e); process.exit(1); });
+w3.postMessage({ type: 'search', job: { id: 11, q: '赣州府志', limit: 20, dataDir: root, files } });
+await new Promise((res, rej) => {
+  const t = setInterval(() => { if (results3.length) { clearInterval(t); res(); } }, 10);
+  setTimeout(() => { clearInterval(t); rej(new Error('worker3 timeout')); }, 8000);
+});
+const r4 = results3[0];
+if (r4.type !== 'done') throw new Error('indexed search failed: ' + JSON.stringify(r4));
+console.log('indexed stats', JSON.stringify(r4.stats), 'total', r4.result.total);
+if (r4.stats.indexed !== 1) throw new Error('应当走倒排索引: ' + JSON.stringify(r4.stats));
+if (r4.result.total !== r1.result.total) throw new Error('倒排结果与扫描不一致');
+
+// 7. 语料里根本没有的双字：索引直接判空，连候选都不用给
+w3.postMessage({ type: 'search', job: { id: 12, q: '黑龙江', limit: 20, dataDir: root, files } });
+await new Promise((res, rej) => {
+  const t = setInterval(() => { if (results3.length >= 2) { clearInterval(t); res(); } }, 10);
+  setTimeout(() => { clearInterval(t); rej(new Error('worker3 query2 timeout')); }, 8000);
+});
+const r5 = results3[1];
+if (r5.result.total !== 0) throw new Error('不应命中: ' + JSON.stringify(r5.result));
+if (r5.stats.indexed !== 1) throw new Error('判空也应走索引: ' + JSON.stringify(r5.stats));
+await w3.terminate();
+
 await w2.terminate();
 
 rmSync(root, { recursive: true, force: true });

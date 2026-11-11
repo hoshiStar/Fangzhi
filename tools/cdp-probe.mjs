@@ -200,6 +200,21 @@ await check('识别任务控件就绪', `!!document.getElementById('x-start') &&
 await evaluate(ws, `document.getElementById('x-close').click()`);
 await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
 
+// 全文索引面板（只读状态；重建索引会写数据目录，留给手工或 FZ_CDP_BUILD_INDEX）
+await evaluate(ws, `document.getElementById('btn-textindex').click()`);
+await waitFor(`!!document.getElementById('ti-build')`);
+await check('全文索引面板已打开', `document.getElementById('modal-card').textContent`, (v) => /倒排索引/.test(v));
+await check('全文索引状态可见', `document.getElementById('ti-state').textContent`,
+  (v) => /已建/.test(v) || /还没有倒排索引/.test(v));
+await check('全文索引待重建按钮', `!!document.getElementById('ti-build')`, (v) => v === true);
+if (process.env.FZ_CDP_BUILD_INDEX === '1') {
+  await evaluate(ws, `document.getElementById('ti-build').click()`);
+  await waitFor(`/完成：|失败|没有/.test(document.getElementById('ti-msg')?.textContent ?? '')`, 180000);
+  await check('全文索引重建完成', `document.getElementById('ti-msg')?.textContent`, (v) => /完成：/.test(v));
+}
+await evaluate(ws, `document.getElementById('ti-close').click()`);
+await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+
 // 书签与最近阅读面板
 await evaluate(ws, `document.getElementById('btn-lib').click()`);
 await waitFor(`!!document.getElementById('l-clear')`);
@@ -281,8 +296,11 @@ await check('爬取弹层出现', `!document.getElementById('crawlbar').classLis
 await check('爬取链接预填', `document.getElementById('c-url').value`, (v) => v === 'https://pan.quark.cn/s/2d5c2ddfe25b');
 await evaluate(ws, `document.getElementById('c-close')?.click()`);
 
-// 全库全文检索：查一个只出现在 OCR 正文、不在书名里的词，验证 worker 线程链路真的通了
-await typeQuery('成文出版社', '成文出版社');
+// 全库全文检索：查一个只出现在 OCR 正文、不在书名里的词，验证 worker 线程链路真的通了。
+// 这类查询的书名结果是空的，摘要不会回显查询词，所以只等正文结果块，不等摘要。
+// 先把上一轮的全文块清掉：否则「等结果块出现」会立刻被旧内容满足，读到过期命中。
+await evaluate(ws, `(()=>{const b=document.getElementById('textlist');b.classList.add('hidden');b.innerHTML='';})()`);
+await typeQuery('成文出版社');
 const textHit = await waitFor(`/全文命中|全文没有命中/.test(document.getElementById('textlist').textContent)`, 25000);
 await check('全文检索返回结果块', textHit, (v) => v === true);
 await check('全文命中计数', `document.getElementById('textlist').textContent`, (v) => /全文命中\s*\d+\s*处/.test(v));

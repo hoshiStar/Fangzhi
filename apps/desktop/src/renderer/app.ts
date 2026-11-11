@@ -42,6 +42,15 @@ declare global {
       }>;
       onTextProgress(cb: (p: { scanned: number; total: number; q: string }) => void): () => void;
       ocrSummary(): Promise<{ totalFiles: number; textFiles: number; doneFiles: number; doneBooks: number; totalBooks: number }>;
+      textIndexStatus(): Promise<{
+        built: boolean;
+        meta: { builtAt: string; bigramCount: number; prunedBigrams: number; postingCount: number; files: Array<{ fid: string; pages: number }> } | null;
+        stale: string[];
+        textFiles: number;
+        bytes: number;
+      }>;
+      buildTextIndex(): Promise<{ ok: boolean; error?: string; meta?: { bigramCount: number; postingCount: number } }>;
+      onTextIndexProgress(cb: (p: { done: number; total: number }) => void): () => void;
       openOcrFolder(): Promise<{ ok: boolean; dir?: string; error?: string }>;
       ocrRunnerStatus(): Promise<{ job: OcrJobState; runtime: { runtime: string; label: string; note: string } }>;
       ocrRunnerStart(opts: { limit?: number; maxPages?: number; force?: boolean; fids?: string[] }): Promise<{ ok: boolean; error?: string }>;
@@ -478,6 +487,65 @@ function openModal(html: string): HTMLElement {
 function closeModal(): void {
   $('modal').classList.add('hidden');
   $('modal-card').innerHTML = '';
+}
+
+/* ---------- 全文倒排索引 ---------- */
+async function textIndexModal(): Promise<void> {
+  const initial = await window.fz.textIndexStatus();
+  const card = openModal(`
+    <h2>全文索引</h2>
+    <p>倒排索引把「双字 → 页码」预先存下来：全文检索先用它定位候选页，再回正文核实，
+      不必每次都把上千本书的正文读一遍。当前 <b>${initial.textFiles}</b> 个文件有识别文本。</p>
+    <div id="ti-state"></div>
+    <p class="thint">识别出新文本后不必马上重建：检索会把它们按「未覆盖」整篇扫描，结果仍然是全的；
+      等积累几本再重建，速度才会回来。</p>
+    <div class="row">
+      <button id="ti-build" class="primary">重建索引</button>
+      <button id="ti-close" class="ghost">关闭</button>
+      <span id="ti-msg" class="msg"></span>
+    </div>`);
+  const stateBox = card.querySelector<HTMLElement>('#ti-state')!;
+  const msg = card.querySelector<HTMLSpanElement>('#ti-msg')!;
+  const btn = card.querySelector<HTMLButtonElement>('#ti-build')!;
+
+  const render = (s: typeof initial): void => {
+    if (!s.built || !s.meta) {
+      stateBox.innerHTML = '<div class="row"><span class="msg">还没有倒排索引，全文检索当前逐本扫描（有位图预筛）。</span></div>';
+      return;
+    }
+    const m = s.meta;
+    const when = new Date(m.builtAt);
+    const stamp = Number.isNaN(when.getTime()) ? m.builtAt : when.toLocaleString();
+    stateBox.innerHTML = `
+      <div class="row"><span>已建 · ${esc(stamp)}</span><span>· ${formatSize(s.bytes)}</span></div>
+      <div class="row"><span>覆盖 ${m.files.length} 个文件 · 双字 ${m.bigramCount}（剪枝 ${m.prunedBigrams}）· 倒排 ${m.postingCount} 条</span></div>
+      ${s.stale.length ? `<div class="row"><span class="msg">${s.stale.length} 个文件在索引之后变过，检索时按未覆盖整篇扫描</span></div>` : ''}`;
+  };
+  render(initial);
+
+  const off = window.fz.onTextIndexProgress(({ done, total }) => {
+    msg.className = 'msg';
+    msg.textContent = `构建中 ${done}/${total}`;
+  });
+  card.querySelector('#ti-close')!.addEventListener('click', () => {
+    off();
+    closeModal();
+  });
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    msg.className = 'msg';
+    msg.textContent = '准备构建…';
+    const r = await window.fz.buildTextIndex();
+    btn.disabled = false;
+    if (!r.ok) {
+      msg.className = 'msg err';
+      msg.textContent = r.error ?? '构建失败';
+      return;
+    }
+    msg.className = 'msg ok';
+    msg.textContent = `完成：${r.meta?.bigramCount ?? 0} 个双字 · ${r.meta?.postingCount ?? 0} 条倒排`;
+    render(await window.fz.textIndexStatus());
+  });
 }
 
 async function cookieModal(hint = ''): Promise<void> {
@@ -1271,6 +1339,7 @@ for (const b of document.querySelectorAll<HTMLElement>('.toolmenu button')) {
 }
 $('btn-cookie').addEventListener('click', () => void cookieModal());
 $('btn-ocr').addEventListener('click', () => void ocrModal());
+$('btn-textindex').addEventListener('click', () => void textIndexModal());
 $('btn-lib').addEventListener('click', () => void libraryModal());
 $('btn-dl').addEventListener('click', async () => {
   const tray = $('dltray');

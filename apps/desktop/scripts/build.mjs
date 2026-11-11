@@ -43,6 +43,16 @@ await build({
   target: 'node22',
 });
 
+// 倒排索引构建线程：同上，按路径起线程，整目录拷贝时自动带上。
+await build({
+  ...shared,
+  entryPoints: ['src/main/text-index-worker.ts'],
+  outfile: 'dist/main/text-index-worker.cjs',
+  platform: 'node',
+  format: 'cjs',
+  target: 'node22',
+});
+
 await build({
   entryPoints: ['src/renderer/app.ts'],
   outfile: 'dist/renderer/app.js',
