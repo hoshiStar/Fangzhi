@@ -3,6 +3,12 @@ import type { CrawlCheckpoint } from './packages/core/src/crawl.ts';
 import { readFileSync } from 'node:fs';
 import type { RawShareDump } from './packages/core/src/types.ts';
 
+// 本脚本会访问真实夸克分享并执行完整目录遍历，必须显式确认。
+if (!process.argv.includes('--run')) {
+  console.error('拒绝执行：该脚本会真实联网爬取。确认后运行 node verify-crawl-resume.ts --run');
+  process.exit(1);
+}
+
 const target = parseShareUrl('https://pan.quark.cn/s/2d5c2ddfe25b');
 const full = JSON.parse(readFileSync('./data/raw.json', 'utf8')) as RawShareDump;
 
@@ -44,3 +50,4 @@ const dupes = fids.length - new Set(fids).size;
 const ok = d.added === 0 && d.removed === 0 && d.changed === 0 && dupes === 0
   && files(resumed.dump) === files(full) && dirs(resumed.dump) === dirs(full);
 console.log(ok ? 'PASS 续爬结果与完整爬取一致' : `FAIL 重复行=${dupes} 文件=${files(resumed.dump)}/${files(full)} 目录=${dirs(resumed.dump)}/${dirs(full)}`);
+if (!ok) process.exitCode = 1;

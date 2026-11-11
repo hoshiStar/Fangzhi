@@ -7,6 +7,7 @@ const api = {
   search: (q: string, filters: SearchFilters, limit: number, offset: number) =>
     ipcRenderer.invoke('search', q, filters, limit, offset),
   book: (id: string) => ipcRenderer.invoke('book', id),
+  bookOverrideSet: (id: string, patch: unknown) => ipcRenderer.invoke('book-override-set', id, patch),
   facets: () => ipcRenderer.invoke('facets'),
   exportLean: () => ipcRenderer.invoke('export-lean'),
   crawl: (url: string, resume: boolean) => ipcRenderer.invoke('crawl', url, resume),
@@ -19,9 +20,10 @@ const api = {
   cookieClear: () => ipcRenderer.invoke('cookie-clear'),
   cookieTest: () => ipcRenderer.invoke('cookie-test'),
   dlList: () => ipcRenderer.invoke('dl-list'),
-  dlEnqueue: (items: Array<{ fid: string; name: string; size: number; pdirFid: string; shareFidToken: string }>) =>
+  dlEnqueue: (items: Array<{ fid: string; bookId: string; name: string; size: number; pdirFid: string; shareFidToken: string }>) =>
     ipcRenderer.invoke('dl-enqueue', items),
   dlCancel: (fid?: string) => ipcRenderer.invoke('dl-cancel', fid),
+  dlRetry: (fid: string) => ipcRenderer.invoke('dl-retry', fid),
   dlInfo: () => ipcRenderer.invoke('dl-info'),
   dlLocal: (fids: string[]) => ipcRenderer.invoke('dl-local', fids),
   dlDir: () => ipcRenderer.invoke('dl-dir'),
@@ -30,6 +32,8 @@ const api = {
   ocrPage: (fid: string, p: number, q?: string) => ipcRenderer.invoke('ocr-page', fid, p, q),
   ocrSearch: (fid: string, q: string) => ipcRenderer.invoke('ocr-search', fid, q),
   searchText: (q: string) => ipcRenderer.invoke('search-text', q),
+  ocrSummary: () => ipcRenderer.invoke('ocr-summary'),
+  openOcrFolder: () => ipcRenderer.invoke('open-ocr-folder'),
   onCrawlProgress: (cb: (p: unknown) => void) => {
     const h = (_e: unknown, p: unknown) => cb(p);
     ipcRenderer.on('crawl-progress', h);

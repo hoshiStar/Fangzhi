@@ -29,10 +29,10 @@ const mini = {
   stats: lean.stats,
   books: lean.books,
   // fid / ocrStatus 只服务于下载和 OCR，检索和展示都用不到，裁掉省约 300KB。
-  // id 必须留：getBook 靠它把文件挂回书目。
+  // id 必须留：getBook 靠它把文件挂回书目；isNoise 必须留：否则全噪声书会混进结果。
   files: lean.files.map((f) => ({
     id: f.id, name: f.name, size: f.size, ext: f.ext, bookId: f.bookId,
-    volume: f.volume, part: f.part, section: f.section,
+    volume: f.volume, part: f.part, section: f.section, isNoise: f.isNoise,
   })),
 };
 writeFileSync(join(here, 'index.mini.json'), JSON.stringify(mini));

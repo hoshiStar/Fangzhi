@@ -1,5 +1,8 @@
 // 通过 CDP 驱动真实窗口，检查渲染结果。用法: node tools/cdp-probe.mjs [port]
+// 账号/下载检查会写假 cookie 并清除，默认跳过；只在独立测试 profile 上显式开启：
+//   FZ_CDP_ALLOW_COOKIE_MUTATION=1 node tools/cdp-probe.mjs
 const port = process.argv[2] ?? '9333';
+const allowCookieMutation = process.env.FZ_CDP_ALLOW_COOKIE_MUTATION === '1';
 const base = `http://127.0.0.1:${port}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -133,57 +136,83 @@ await check('详情著录信息', `document.querySelector('.detail .meta')?.text
 await check('详情文件列表', `document.querySelectorAll('.detail .file').length`, (v) => v === 31);
 await check('夸克跳转按钮存在', `!!document.querySelector('#d-share')`, (v) => v === true);
 
-// 多词检索
+// 多词检索与严格模式
 await typeQuery('光绪 湖南通志', '湖南通志');
 await check('多词检索首条', `document.querySelector('.book .t')?.textContent`, (v) => v === '湖南通志');
 await check('多词检索朝代标注', `document.querySelector('.book .m')?.textContent`, (v) => /光绪/.test(v));
+await evaluate(ws, `(()=>{const el=document.getElementById('strict');el.checked=true;el.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+await waitFor(`/严格匹配/.test(document.getElementById('summary').textContent)`);
+await check('严格全词模式生效', `document.getElementById('summary').textContent`, (v) => /严格匹配/.test(v));
+await evaluate(ws, `(()=>{const el=document.getElementById('strict');el.checked=false;el.dispatchEvent(new Event('change',{bubbles:true}));})()`);
 
 // 无结果
 await typeQuery('量子力学导论');
 await waitFor(`!!document.querySelector('.empty')`);
 await check('无结果提示', `document.querySelector('.empty')?.textContent`, (v) => /没有匹配/.test(v));
+await check('无结果时收起旧详情', `document.getElementById('detail').classList.contains('hidden')`, (v) => v === true);
+
+// 工具菜单与全文覆盖
+await evaluate(ws, `document.getElementById('btn-ocr').click()`);
+await waitFor(`!!document.getElementById('o-open')`);
+await check('全文识别覆盖说明', `document.getElementById('modal-card').textContent`, (v) => /全文检索/.test(v) && /10\/4600/.test(v));
+await evaluate(ws, `document.getElementById('o-close').click()`);
+await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+
+// 人工校正入口（只打开，不写数据）
+await typeQuery('保定府志', '保定府志');
+await evaluate(ws, `document.querySelector('.book').click()`);
+await waitFor(`!!document.querySelector('#d-edit')`);
+await evaluate(ws, `document.getElementById('d-edit').click()`);
+await waitFor(`!!document.getElementById('o-title')`);
+await check('书目校正表单', `document.querySelectorAll('.editgrid input').length`, (v) => v === 7);
+await evaluate(ws, `document.getElementById('o-close').click()`);
+await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
 
 // 更新索引弹层
 await evaluate(ws, `(async () => { document.getElementById('btn-crawl').click(); await new Promise(r => setTimeout(r, 300)); })()`);
 await check('爬取弹层出现', `!document.getElementById('crawlbar').classList.contains('hidden') && !!document.getElementById('c-url')`, (v) => v === true);
 await check('爬取链接预填', `document.getElementById('c-url').value`, (v) => v === 'https://pan.quark.cn/s/2d5c2ddfe25b');
 
-// 下载与账号
-await check('详情下载按钮存在', `!!document.querySelector('#d-dl')`, (v) => v === true);
-await evaluate(ws, `document.querySelector('#d-dl').click()`);
-await waitFor(`!document.getElementById('modal').classList.contains('hidden')`);
-await check('无 cookie 时下载被拦到账号弹层', `document.getElementById('modal-card').textContent`, (v) => /先配置 cookie/.test(v));
-await evaluate(ws, `document.getElementById('k-close').click()`);
-await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+// 下载与账号：会写/清 cookie，默认不在真实用户目录执行
+if (allowCookieMutation) {
+  await check('详情下载按钮存在', `!!document.querySelector('#d-dl')`, (v) => v === true);
+  await evaluate(ws, `document.querySelector('#d-dl').click()`);
+  await waitFor(`!document.getElementById('modal').classList.contains('hidden')`);
+  await check('无 cookie 时下载被拦到账号弹层', `document.getElementById('modal-card').textContent`, (v) => /先配置 cookie/.test(v));
+  await evaluate(ws, `document.getElementById('k-close').click()`);
+  await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
 
-await evaluate(ws, `document.getElementById('btn-cookie').click()`);
-await waitFor(`!!document.getElementById('k-raw')`);
-await check('账号弹层显示未配置', `document.getElementById('modal-card').textContent`, (v) => /未配置/.test(v));
-await evaluate(ws, `(()=>{const t=document.getElementById('k-raw');t.value='garbage';document.getElementById('k-save').click();})()`);
-await waitFor(`/格式不对/.test(document.getElementById('k-msg').textContent)`);
-await check('非法 cookie 被拒', `document.getElementById('k-msg').textContent`, (v) => /格式不对/.test(v));
-await evaluate(ws, `(()=>{const t=document.getElementById('k-raw');t.value='a=1; b=2';document.getElementById('k-save').click();})()`);
-await waitFor(`/已保存/.test(document.getElementById('k-msg').textContent)`);
-await check('cookie 保存(加密落盘)', `document.getElementById('k-msg').textContent`, (v) => /已保存/.test(v));
-await evaluate(ws, `document.getElementById('k-test').click()`);
-await waitFor(`document.getElementById('k-msg').textContent !== '测试中…'`, 15000);
-await check('假 cookie 被测出失效', `document.getElementById('k-msg').textContent + '|' + document.getElementById('k-msg').className`, (v) => /失效|未登录|不完整|failed|失败/.test(v) && /err/.test(v));
-await evaluate(ws, `document.getElementById('k-clear').click()`);
-await waitFor(`/已清除/.test(document.getElementById('k-msg').textContent)`);
-await check('cookie 清除', `document.getElementById('modal-card').textContent`, (v) => /已清除/.test(v));
-await evaluate(ws, `document.getElementById('k-close').click()`);
-await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
-await evaluate(ws, `document.getElementById('btn-cookie').click()`);
-await waitFor(`!!document.getElementById('k-raw')`);
-await check('清除后重开确未配置(加密文件已删)', `document.getElementById('modal-card').textContent`, (v) => /未配置/.test(v));
-await evaluate(ws, `document.getElementById('k-close').click()`);
-await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+  await evaluate(ws, `document.getElementById('btn-cookie').click()`);
+  await waitFor(`!!document.getElementById('k-raw')`);
+  await check('账号弹层显示未配置', `document.getElementById('modal-card').textContent`, (v) => /未配置/.test(v));
+  await evaluate(ws, `(()=>{const t=document.getElementById('k-raw');t.value='garbage';document.getElementById('k-save').click();})()`);
+  await waitFor(`/格式不对/.test(document.getElementById('k-msg').textContent)`);
+  await check('非法 cookie 被拒', `document.getElementById('k-msg').textContent`, (v) => /格式不对/.test(v));
+  await evaluate(ws, `(()=>{const t=document.getElementById('k-raw');t.value='a=1; b=2';document.getElementById('k-save').click();})()`);
+  await waitFor(`/已保存|密钥服务不可用/.test(document.getElementById('k-msg').textContent)`);
+  await check('cookie 保存走加密或明确拒绝', `document.getElementById('k-msg').textContent`, (v) => /已保存|密钥服务不可用/.test(v));
+  await evaluate(ws, `document.getElementById('k-test').click()`);
+  await waitFor(`document.getElementById('k-msg').textContent !== '测试中…'`, 15000);
+  await check('假 cookie 被测出失效', `document.getElementById('k-msg').textContent + '|' + document.getElementById('k-msg').className`, (v) => /失效|未登录|不完整|failed|失败/.test(v) && /err/.test(v));
+  await evaluate(ws, `document.getElementById('k-clear').click()`);
+  await waitFor(`/已清除/.test(document.getElementById('k-msg').textContent)`);
+  await check('cookie 清除', `document.getElementById('modal-card').textContent`, (v) => /已清除/.test(v));
+  await evaluate(ws, `document.getElementById('k-close').click()`);
+  await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+  await evaluate(ws, `document.getElementById('btn-cookie').click()`);
+  await waitFor(`!!document.getElementById('k-raw')`);
+  await check('清除后重开确未配置(加密文件已删)', `document.getElementById('modal-card').textContent`, (v) => /未配置/.test(v));
+  await evaluate(ws, `document.getElementById('k-close').click()`);
+  await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
 
-await evaluate(ws, `document.getElementById('btn-dl').click()`);
-await waitFor(`!document.getElementById('dltray').classList.contains('hidden')`);
-await check('下载托盘空态', `document.getElementById('dltray').textContent`, (v) => /队列为空/.test(v));
-await evaluate(ws, `document.getElementById('t-close').click()`);
-await check('下载托盘收起', `document.getElementById('dltray').classList.contains('hidden')`, (v) => v === true);
+  await evaluate(ws, `document.getElementById('btn-dl').click()`);
+  await waitFor(`!document.getElementById('dltray').classList.contains('hidden')`);
+  await check('下载托盘空态', `document.getElementById('dltray').textContent`, (v) => /队列为空/.test(v));
+  await evaluate(ws, `document.getElementById('t-close').click()`);
+  await check('下载托盘收起', `document.getElementById('dltray').classList.contains('hidden')`, (v) => v === true);
+} else {
+  console.log('SKIP  账号/下载写操作（未设置 FZ_CDP_ALLOW_COOKIE_MUTATION=1）');
+}
 
 await sleep(300);
 console.log('\n页面报错:', errors.length ? errors : '无');

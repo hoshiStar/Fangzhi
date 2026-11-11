@@ -1,6 +1,6 @@
 /**
  * 索引 schema。两端共用：桌面版读 full，小程序读 lean。
- * 全文检索字段已预留（ocrStatus / textRef），当前不填充。
+ * OCR 字段由 Python 支线回写；lean 保留检索必需的噪声标记，确保两端语义一致。
  */
 
 export const SCHEMA_VERSION = 1 as const;
@@ -96,6 +96,8 @@ export interface BookRecord {
   exts: ExtKind[];
   /** 全文预留：已完成 OCR 的文件数。 */
   ocrDone: number;
+  /** 被人工校正过。用于 UI 区分机器解析与人工确认。 */
+  verified?: boolean;
 }
 
 export interface IndexStats {
@@ -152,6 +154,8 @@ export interface LeanIndex {
     volume?: string;
     part?: string;
     section?: string;
+    /** 必须保留：搜索默认排除全噪声书目，缺失会导致桌面端与小程序结果不一致。 */
+    isNoise: boolean;
     ocrStatus: OcrStatus;
   }>;
 }
@@ -173,6 +177,7 @@ export function toLean(idx: GazetteerIndex): LeanIndex {
       volume: f.volume,
       part: f.part,
       section: f.section,
+      isNoise: f.isNoise,
       ocrStatus: f.ocrStatus,
     })),
   };

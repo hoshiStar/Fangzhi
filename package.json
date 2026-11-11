@@ -7,12 +7,20 @@
     "packages/*",
     "apps/*"
   ],
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "crawl": "node packages/core/src/cli.ts crawl",
     "build-index": "node packages/core/src/cli.ts build-index",
     "stats": "node packages/core/src/cli.ts stats",
     "search": "node packages/core/src/cli.ts search",
-    "typecheck": "tsc -p packages/core/tsconfig.json --noEmit"
+    "build:desktop": "npm run build --workspace @fangzhi/desktop",
+    "package:desktop": "npm run package --workspace @fangzhi/desktop",
+    "build:mini": "node apps/miniprogram/build.mjs",
+    "typecheck": "tsc -p packages/core/tsconfig.json --noEmit",
+    "test": "node --test tests/core.test.ts tests/download.test.ts",
+    "verify": "npm run typecheck && npm run typecheck --workspace @fangzhi/desktop && npm test && node apps/miniprogram/smoke.cjs"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

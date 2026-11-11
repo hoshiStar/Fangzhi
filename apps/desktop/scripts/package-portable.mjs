@@ -1,7 +1,8 @@
 // 手工装配便携版。electron-builder 的 asar 打包步骤在本机被 EBUSY 锁死，
 // 而 Electron 本身只认 resources/app（或 app.asar），直接拼目录效果等价。
 // 用法: node scripts/package-portable.mjs [输出目录]
-import { cpSync, mkdirSync, renameSync, rmSync, writeFileSync, statSync, existsSync } from 'node:fs';
+import { cpSync, mkdirSync, renameSync, rmSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -11,6 +12,7 @@ const repo = resolve(desktop, '..', '..');
 const out = process.argv[2] ? resolve(process.argv[2]) : join(repo, 'release', 'portable-win-x64');
 
 const src = join(repo, 'data', 'index.full.json');
+const pkg = JSON.parse(readFileSync(join(desktop, 'package.json'), 'utf8'));
 if (!existsSync(join(desktop, 'dist', 'main', 'index.cjs'))) {
   console.error('缺少 dist/，先跑 npm run build');
   process.exit(1);
@@ -29,7 +31,7 @@ mkdirSync(app, { recursive: true });
 writeFileSync(join(app, 'package.json'), JSON.stringify({
   name: 'fangzhi-desktop',
   productName: '方志检索',
-  version: '0.1.0',
+  version: pkg.version,
   private: true,
   main: 'dist/main/index.cjs',
 }, null, 2) + '\n');
@@ -44,10 +46,50 @@ if (existsSync(meta)) cpSync(meta, join(data, 'meta.json'));
 const ocrDir = join(repo, 'data', 'ocr');
 if (existsSync(ocrDir)) cpSync(ocrDir, join(data, 'ocr'), { recursive: true });
 
+/** 递归收集文件，用于版本清单和 OCR 覆盖率核对。 */
+function walkFiles(dir) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const p = join(dir, e.name);
+    return e.isDirectory() ? walkFiles(p) : [p];
+  });
+}
+
+const indexBytes = readFileSync(src);
+const idx = JSON.parse(indexBytes.toString('utf8'));
+const missingOcr = (idx.files ?? [])
+  .filter((f) => f.textRef && !existsSync(join(data, String(f.textRef))))
+  .map((f) => f.textRef);
+if (missingOcr.length) {
+  console.error(`发布中止：索引引用了 ${missingOcr.length} 个缺失的 OCR 文件，例如 ${missingOcr[0]}`);
+  process.exit(1);
+}
+const ocrFiles = walkFiles(join(data, 'ocr'));
+const manifest = {
+  generatedAt: new Date().toISOString(),
+  appVersion: pkg.version,
+  schemaVersion: idx.schemaVersion,
+  crawledAt: idx.crawledAt,
+  index: {
+    sha256: createHash('sha256').update(indexBytes).digest('hex'),
+    fileCount: idx.stats?.fileCount ?? idx.files?.length ?? 0,
+    bookCount: idx.stats?.bookCount ?? idx.books?.length ?? 0,
+    totalSize: idx.stats?.totalSize ?? 0,
+    ocrRefs: (idx.files ?? []).filter((f) => f.textRef).length,
+  },
+  ocr: {
+    files: ocrFiles.length,
+    bytes: ocrFiles.reduce((n, p) => n + statSync(p).size, 0),
+  },
+};
+writeFileSync(join(data, 'data-manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+
 renameSync(join(out, 'electron.exe'), join(out, '方志检索.exe'));
 
 const mb = (p) => (statSync(p).size / 1048576).toFixed(1);
 console.log(`便携版 -> ${out}`);
+console.log(`  version ${manifest.appVersion} · index ${manifest.index.sha256.slice(0, 12)}`);
 console.log(`  方志检索.exe  ${mb(join(out, '方志检索.exe'))} MB`);
 console.log(`  resources/app ${mb(join(app, 'dist', 'main', 'index.cjs'))} MB (main bundle)`);
 console.log(`  resources/data/index.full.json  ${mb(join(data, 'index.full.json'))} MB`);
+console.log(`  OCR ${manifest.ocr.files} 文件 · 索引引用 ${manifest.index.ocrRefs} 个`);

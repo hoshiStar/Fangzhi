@@ -3,8 +3,11 @@ release/
 dist/
 data/
 tools/ocr/models/
+.venv/
 __pycache__/
 *.pyc
 *.log
 .tmp/
+.tmp-*/
+.workbuddy/
 .DS_Store

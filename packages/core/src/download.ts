@@ -41,7 +41,16 @@ interface LinkResponse {
   data?: Array<{ fid: string; file_name: string; size: number; download_url?: string }>;
 }
 
-let social: { token: string; expiredAt: number } | null = null;
+/**
+ * 账号级令牌必须按 cookie 隔离；同一进程里切换账号后不能复用上一个人的令牌。
+ * 键只保存在内存，不落盘、不写日志。
+ */
+const social = new Map<string, { token: string; expiredAt: number }>();
+
+export function clearSocialToken(cookie?: string): void {
+  if (cookie === undefined) social.clear();
+  else social.delete(cookie);
+}
 
 /**
  * 下载令牌。分享页场景拿不到也允许（传空串），但 31001 要抛出来——
@@ -49,7 +58,8 @@ let social: { token: string; expiredAt: number } | null = null;
  */
 export async function acquireSocialToken(cookie: string, signal?: AbortSignal): Promise<string> {
   const now = Date.now();
-  if (social && social.expiredAt > now + 60_000) return social.token;
+  const cached = social.get(cookie);
+  if (cached && cached.expiredAt > now + 60_000) return cached.token;
   const t = Math.floor(now / 1000);
   const res = await fetch(SOCIAL_API, {
     method: 'POST',
@@ -62,8 +72,15 @@ export async function acquireSocialToken(cookie: string, signal?: AbortSignal): 
     throw new QuarkShareError(j.message ?? 'require login', j.code, true);
   }
   if (j.code !== 0 || !j.data?.token) return '';
-  social = { token: j.data.token, expiredAt: j.data.expired_timestamp ?? 0 };
-  return social.token;
+  social.delete(cookie);
+  social.set(cookie, { token: j.data.token, expiredAt: j.data.expired_timestamp ?? 0 });
+  // 只保留少量最近账号，避免长时间运行后无界增长
+  while (social.size > 4) {
+    const oldest = social.keys().next().value;
+    if (oldest === undefined) break;
+    social.delete(oldest);
+  }
+  return j.data.token;
 }
 
 /** 登录态自检。cookie-test 用它，比随便猜一个会员接口可靠。 */

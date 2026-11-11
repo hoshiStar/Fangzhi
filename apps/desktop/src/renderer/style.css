@@ -54,7 +54,7 @@ body { display: flex; flex-direction: column; }
 .searchbox { position: relative; flex: 1 1 auto; }
 .searchbox input {
   width: 100%;
-  padding: 9px 34px 9px 12px;
+  padding: 9px 118px 9px 12px;
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -68,8 +68,43 @@ body { display: flex; flex-direction: column; }
   position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
   padding: 2px 6px; font-size: 12px;
 }
+.searchbox .strict {
+  position: absolute; right: 38px; top: 50%; transform: translateY(-50%);
+  display: flex; align-items: center; gap: 3px;
+  color: var(--fg-dim); font-size: 11px; cursor: pointer; user-select: none;
+}
+.searchbox .strict input { width: auto; padding: 0; margin: 0; accent-color: var(--accent); }
 
-.topbtns { display: flex; gap: 8px; flex: 0 0 auto; }
+.topbtns { display: flex; gap: 8px; flex: 0 0 auto; align-items: center; }
+.tools { position: relative; }
+.tools summary {
+  list-style: none;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--fg);
+  cursor: pointer;
+  user-select: none;
+}
+.tools summary::-webkit-details-marker { display: none; }
+.tools summary:hover, .tools[open] summary { border-color: var(--accent); color: var(--accent); }
+.toolmenu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  min-width: 132px;
+  padding: 5px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.toolmenu button { border: 0; text-align: left; padding: 7px 10px; }
+.toolmenu button:hover { background: var(--accent-soft); }
 
 button {
   font: inherit;
@@ -305,6 +340,37 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
 .modal .msg { font-size: 12px; }
 .modal .msg.ok { color: var(--ok); }
 .modal .msg.err { color: var(--err); }
+.modal .editgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+  margin-top: 12px;
+}
+.modal .editgrid label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--fg-dim); }
+.modal .editgrid input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--fg);
+  font: inherit;
+  outline: none;
+}
+.modal .editgrid input:focus { border-color: var(--accent); }
+.modal pre {
+  margin: 8px 0;
+  padding: 9px 11px;
+  overflow-x: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--fg);
+  font: 12px/1.5 Consolas, monospace;
+}
+.ocrbar { height: 6px; margin: 10px 0; background: var(--line); border-radius: 3px; overflow: hidden; }
+.ocrbar i { display: block; height: 100%; background: var(--accent); }
+.thint { padding: 4px 12px 10px; font-size: 11px; color: var(--fg-dim); }
 
 .dltray {
   position: fixed; right: 16px; bottom: 34px; z-index: 30;

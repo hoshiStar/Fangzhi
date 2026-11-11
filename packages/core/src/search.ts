@@ -18,6 +18,8 @@ export interface SearchFilters {
   ocrDoneOnly?: boolean;
   /** 是否包含噪声文件所属的书。默认 false。 */
   includeNoise?: boolean;
+  /** 多词查询要求每个词都在书名或文件信息中命中，不接受部分命中。 */
+  allTermsOnly?: boolean;
   minSize?: number;
   maxSize?: number;
 }
@@ -33,21 +35,30 @@ export interface FileHit {
   field: 'name' | 'volume' | 'section';
 }
 
+export type MatchKind = 'browse' | 'exact' | 'field' | 'file' | 'partial' | 'fuzzy';
+
 export interface BookHit {
   book: BookRecord;
   score: number;
   /** 命中字段，按贡献度排序。 */
   matched: string[];
   files: FileHit[];
-  /**
-   * false = 只靠分词/文件名兜底命中，不是真正的字段级匹配。
-   * 精确结果够多时这批会被整体丢弃，UI 也可以拿它画分隔线。
-   */
+  /** 仍是“直接命中”的快捷判断；partial / fuzzy 为 false。 */
   direct: boolean;
+  /** 给 UI 分组和解释命中质量。 */
+  match: MatchKind;
 }
 
 export interface SearchResult {
+  /** 所有有分数的命中数（包含部分命中与近似结果）。 */
   total: number;
+  /** 书名、字段或文件信息直接命中的数量，适合作为 UI 的主命中数。 */
+  directTotal: number;
+  /** 当前结果集中实际可取到的条数，分页必须以它为准。 */
+  available: number;
+  /** 部分命中/近似命中的总数，以及本次实际保留的条数。 */
+  weakTotal: number;
+  weakShown: number;
   items: BookHit[];
   elapsedMs: number;
   /** 本次结果集内的分面统计，供 UI 收窄用。 */
@@ -61,11 +72,32 @@ export interface Facets {
   ext: Record<string, number>;
 }
 
-/** 分面：某个维度上各取值的书数。 */
-export function computeFacets(idx: AnyIndex): Facets {
+type AnyFile = FileRecord | LeanIndex['files'][number];
+
+function fileMapOf(idx: AnyIndex): Map<string, AnyFile> {
+  return new Map(idx.files.map((f) => [f.id, f]));
+}
+
+/** 一本书的全部文件都是噪声时才隐藏；未知旧索引按非噪声处理，避免误删正常书。 */
+function isNoiseBook(b: BookRecord, fileById: Map<string, AnyFile>): boolean {
+  const recs = b.fileIds.map((id) => fileById.get(id)).filter((x): x is AnyFile => !!x);
+  return recs.length > 0 && recs.every((f) => f.isNoise === true);
+}
+
+/** 与检索默认口径一致的可检索书目数，供界面说明“为什么不是全部书目”。 */
+export function countSearchableBooks(idx: AnyIndex, includeNoise = false): number {
+  if (includeNoise) return idx.books.length;
+  const fileById = fileMapOf(idx);
+  return idx.books.filter((b) => !isNoiseBook(b, fileById)).length;
+}
+
+/** 分面：某个维度上各取值的书数。默认与检索一致，排除全噪声书目。 */
+export function computeFacets(idx: AnyIndex, includeNoise = false): Facets {
   const bump = (o: Record<string, number>, k: string | undefined) => { if (k) o[k] = (o[k] ?? 0) + 1; };
   const f: Facets = { province: {}, era: {}, zhiType: {}, ext: {} };
+  const fileById = includeNoise ? null : fileMapOf(idx);
   for (const b of idx.books) {
+    if (fileById && isNoiseBook(b, fileById)) continue;
     bump(f.province, b.province);
     bump(f.era, b.era);
     bump(f.zhiType, b.zhiType);
@@ -111,25 +143,21 @@ export function charOverlap(chars: string[], target: string): number {
   return shared / chars.length;
 }
 
-/** 至少一半的字对得上才算模糊命中；单字查询走精确匹配就够了。 */
-const FUZZY_MIN_RATIO = 0.5;
+/** 至少三分之二的字对得上才算近似命中；单字查询走精确匹配就够了。 */
+const FUZZY_MIN_RATIO = 0.67;
 /** 模糊结果最多带这么多条，否则搜"吉水县志"会拖出一千多部含"县志"的志。 */
 const FUZZY_CAP = 20;
 /** 文件级命中的总分上限，防止册数多的书靠数量碾压书名精确命中。 */
 const FILE_SCORE_CAP = 60;
 
-function applyFilters(idx: AnyIndex, f: SearchFilters): { books: BookRecord[]; fileById: Map<string, FileRecord | LeanIndex['files'][number]> } {
-  const fileById = new Map<string, FileRecord | LeanIndex['files'][number]>();
-  for (const fl of idx.files) fileById.set(fl.id, fl);
+function applyFilters(idx: AnyIndex, f: SearchFilters): { books: BookRecord[]; fileById: Map<string, AnyFile> } {
+  const fileById = fileMapOf(idx);
 
   const has = (arr: string[] | undefined) => !!arr && arr.length > 0;
 
   const books = idx.books.filter((b) => {
-    if (!f.includeNoise) {
-      // 全是噪声文件的书直接排除
-      const all = b.fileIds.map((id) => fileById.get(id));
-      if (all.length && all.every((x) => x && 'isNoise' in x && x.isNoise)) return false;
-    }
+    // 全是噪声文件的书直接排除；桌面 full 与小程序 mini 使用同一判定。
+    if (!f.includeNoise && isNoiseBook(b, fileById)) return false;
     if (has(f.provinces) && !(b.province && f.provinces!.includes(b.province))) return false;
     if (has(f.eras) && !(b.era && f.eras!.includes(b.era))) return false;
     if (has(f.zhiTypes) && !(b.zhiType && f.zhiTypes!.includes(b.zhiType))) return false;
@@ -178,7 +206,7 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
     const edition = (b.edition ?? '').toLowerCase();
 
     if (q) {
-      // 单个词在某个字段上的得分。多词查询对每个词各算一次，全中才算精确命中。
+      // 单个词在某个字段上的得分。多词查询对每个词各算一次。
       // place 在没解析出志种时会退化成书名本身，这时它是冗余信息，不再计分——
       // 否则"保定府志序列目录"会因为书名和地名双重命中而压过真正的《保定府志》。
       const placeField = place && place !== title ? place : '';
@@ -197,24 +225,48 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
         return { s, tags };
       };
 
+      const fileHas = (t: string): boolean => files.some((fl) => {
+        const nm = fl.name.toLowerCase();
+        const sec = ('section' in fl && fl.section ? fl.section : '').toLowerCase();
+        const vol = (fl.volume ?? '').toLowerCase();
+        return nm.includes(t) || (!!sec && sec.includes(t)) || (!!vol && vol.includes(t));
+      });
+      const termRows = terms.map((t) => ({ t, field: fieldScore(t), inFile: fileHas(t) }));
+      const anyField = termRows.some((r) => r.field.s > 0);
+      const anyFile = termRows.some((r) => r.inFile);
+      const fieldSum = termRows.reduce((n, r) => n + r.field.s, 0);
+      for (const r of termRows) matched.push(...r.field.tags);
+
       let direct = false;
-      let anyField = false;
+      let match: MatchKind = 'field';
+      let consider = true;
       if (terms.length <= 1) {
-        const r = fieldScore(q);
-        score += r.s;
-        matched.push(...r.tags);
-        anyField = r.tags.length > 0;
-        direct = anyField;
-      } else {
-        let acc = 0;
-        let part = 0;
-        for (const t of terms) {
-          const r = fieldScore(t);
-          if (r.s > 0) { acc += r.s; part++; matched.push(...r.tags); }
+        const r = termRows[0]!;
+        score += r.field.s;
+        if (r.field.s > 0) {
+          direct = true;
+          match = r.field.tags.includes('书名精确') ? 'exact' : 'field';
+        } else if (r.inFile) {
+          direct = true;
+          match = 'file';
+          matched.push('文件信息');
+        } else {
+          match = 'fuzzy';
         }
-        anyField = part > 0;
-        if (part === terms.length) { score += acc; direct = true; }
-        else if (part > 0) { score += Math.round(acc * 0.3); matched.push(`命中${part}/${terms.length}词`); }
+      } else {
+        const covered = termRows.filter((r) => r.field.s > 0 || r.inFile).length;
+        if (covered === terms.length) {
+          score += fieldSum;
+          direct = true;
+          match = anyField ? 'field' : 'file';
+          if (!anyField) matched.push('文件信息');
+        } else if (covered > 0 && !opts.allTermsOnly) {
+          score += Math.round(fieldSum * 0.3);
+          match = 'partial';
+          matched.push(`命中${covered}/${terms.length}词`);
+        } else {
+          consider = false;
+        }
       }
 
       // 文件级命中：分志、卷次这些不在书名里的信息。只做精确子串，
@@ -227,7 +279,7 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
         const sec = ('section' in fl && fl.section ? fl.section : '').toLowerCase();
         const vol = (fl.volume ?? '').toLowerCase();
         let field: FileHit['field'] | undefined;
-        for (const t of terms.length ? terms : [q]) {
+        for (const t of terms) {
           if (nm.includes(t)) { field = 'name'; break; }
           if (sec && sec.includes(t)) { field = 'section'; break; }
           if (vol && vol.includes(t)) { field = 'volume'; break; }
@@ -237,26 +289,31 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
           fileScore += field === 'section' ? 25 : 8;
         }
       }
-      if (fileScore) {
-        score += Math.min(fileScore, FILE_SCORE_CAP);
-        if (!anyField) matched.push('文件内容');
-      }
+      if (fileScore) score += Math.min(fileScore, FILE_SCORE_CAP);
 
-      // 错字容错：一个字都没对上时才启用，避免和真实命中重复计分
-      if (!anyField) {
+      // 错字容错：书名、地名和文件信息都没对上时才启用，避免和真实命中重复计分
+      if (!anyField && !anyFile) {
         const ratio = charOverlap(qChars, title + place + era + zhi);
         if (ratio >= FUZZY_MIN_RATIO && qChars.length >= 2) {
           score += Math.round(ratio * 60);
           matched.push(`近似${Math.round(ratio * 100)}%`);
+          match = 'fuzzy';
         }
       }
 
-      if (score > 0) {
+      if (consider && score > 0) {
         score += b.confidence * 10;
-        (direct ? strong : weak).push({ book: b, score, matched: [...new Set(matched)], files: fileHits, direct });
+        (direct ? strong : weak).push({
+          book: b,
+          score,
+          matched: [...new Set(matched)],
+          files: fileHits,
+          direct,
+          match,
+        });
       }
     } else {
-      strong.push({ book: b, score: 1, matched: [], files: [], direct: true });
+      strong.push({ book: b, score: 1, matched: [], files: [], direct: true, match: 'browse' });
     }
   }
 
@@ -265,18 +322,26 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
   strong.sort(cmp);
 
   const limit = opts.limit ?? 100;
-  // 精确结果填满一页就不再掺模糊结果，否则前几页之后全是噪声
-  const kept = strong.length >= limit ? strong : [...strong, ...weak.sort(cmp).slice(0, FUZZY_CAP)];
+  // 精确结果填满一页就不再掺模糊结果，否则前几页之后全是噪声。
+  // total 保留真实命中数，available 才是实际可翻到的条数。
+  const shownWeak = strong.length >= limit ? [] : weak.sort(cmp).slice(0, FUZZY_CAP);
+  const kept = strong.length >= limit ? strong : [...strong, ...shownWeak];
 
-  const total = kept.length;
+  const total = strong.length + weak.length;
+  const available = kept.length;
   const offset = opts.offset ?? 0;
   const items = kept.slice(offset, offset + limit);
 
   return {
     total,
+    directTotal: strong.length,
+    available,
+    weakTotal: weak.length,
+    weakShown: shownWeak.length,
     items,
     elapsedMs: Date.now() - t0,
-    facets: q ? facetsOf(items.map((h) => h.book)) : facetsOf(books),
+    // 分面基于完整结果集，而不是只统计当前页
+    facets: q ? facetsOf([...strong, ...weak].map((h) => h.book)) : facetsOf(books),
   };
 }
 

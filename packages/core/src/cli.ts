@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, renameSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { crawlShare, diffDumps, parseShareUrl } from './crawl.ts';
 import type { CrawlCheckpoint } from './crawl.ts';
@@ -37,9 +37,12 @@ function positionals(from: number): string[] {
   }
   return out;
 }
+/** 同目录临时文件 + 原子替换，避免进程中断后留下半份索引。 */
 function write(path: string, data: string): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, data);
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, data);
+  renameSync(tmp, path);
 }
 function readJson<T>(path: string): T | undefined {
   return existsSync(path) ? (JSON.parse(readFileSync(path, 'utf8')) as T) : undefined;
@@ -96,7 +99,8 @@ function cmdBuildIndex(): void {
   };
 
   const t = Date.now();
-  const idx = buildIndex(dump, { meta });
+  const previous = readJson<GazetteerIndex>(FULL_PATH);
+  const idx = buildIndex(dump, { meta, previous });
   write(FULL_PATH, JSON.stringify(idx));
   const lean = toLean(idx);
   write(LEAN_PATH, JSON.stringify(lean));

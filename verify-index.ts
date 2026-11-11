@@ -1,8 +1,18 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { buildIndex, toLean } from './packages/core/src/build-index.ts';
-import type { RawShareDump } from './packages/core/src/types.ts';
+import type { GazetteerIndex, RawShareDump } from './packages/core/src/types.ts';
+
+// 本脚本会覆盖 data/index.full.json 和 index.lean.json，必须显式确认。
+if (!process.argv.includes('--write')) {
+  console.error('拒绝执行：该脚本会覆盖索引。确认后运行 node verify-index.ts --write');
+  process.exit(1);
+}
 
 const dump = JSON.parse(readFileSync('./quark-probe/index.json', 'utf8')) as RawShareDump;
+
+const previous = existsSync('./data/index.full.json')
+  ? (JSON.parse(readFileSync('./data/index.full.json', 'utf8')) as GazetteerIndex)
+  : undefined;
 
 const t0 = Date.now();
 const idx = buildIndex(dump, {
@@ -12,6 +22,7 @@ const idx = buildIndex(dump, {
     shareTitle: '全国各地地方志4000+本【101G】',
     author: '百刻*长',
   },
+  previous,
 });
 const ms = Date.now() - t0;
 
@@ -83,3 +94,9 @@ console.log(`  噪声文件: ${idx.files.filter((f) => f.isNoise).length}`);
 idx.files.filter((f) => f.isNoise).slice(0, 6).forEach((f) => console.log('    ' + f.name));
 console.log(`  压缩分卷: ${idx.files.filter((f) => f.isArchivePart).length}`);
 idx.files.filter((f) => f.isArchivePart).slice(0, 6).forEach((f) => console.log(`    ${f.name} -> group=${f.archiveGroup}`));
+
+// 已知回归项必须为零，否则让脚本以失败状态退出。
+if (badTitles.length || stripped.length) {
+  console.error(`\nREGRESSION: ${badTitles.length} 个括号残留, ${stripped.length} 个地名被剥空`);
+  process.exitCode = 1;
+}

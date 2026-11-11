@@ -47,6 +47,8 @@ function confidence(p: ReturnType<typeof parseFileName>): number {
 export interface BuildOptions {
   meta: IndexMeta;
   crawledAt?: string;
+  /** 上一次构建的索引。重建时按 fid 继承 OCR 关联，避免正文突然“消失”。 */
+  previous?: GazetteerIndex;
 }
 
 export function buildIndex(dump: RawShareDump, opts: BuildOptions): GazetteerIndex {
@@ -126,6 +128,25 @@ export function buildIndex(dump: RawShareDump, opts: BuildOptions): GazetteerInd
         ocrDone: 0,
       });
     }
+  }
+
+  // 爬取/重建索引只更新目录事实，不应抹掉已经产出的 OCR 文本。
+  // 以 fid 为稳定键继承，即使书目重新聚合、路径发生变化也能跟着文件走。
+  if (opts.previous) {
+    const oldById = new Map(opts.previous.files.map((f) => [f.fid, f]));
+    for (const f of files) {
+      const old = oldById.get(f.fid);
+      if (!old?.textRef) continue;
+      f.textRef = old.textRef;
+      f.ocrStatus = old.ocrStatus;
+    }
+
+    const doneByBook = new Map<string, number>();
+    for (const f of files) {
+      if (f.ocrStatus !== 'done') continue;
+      doneByBook.set(f.bookId, (doneByBook.get(f.bookId) ?? 0) + 1);
+    }
+    for (const b of bookMap.values()) b.ocrDone = doneByBook.get(b.id) ?? 0;
   }
 
   const books = [...bookMap.values()].sort((a, b) => a.title.localeCompare(b.title, 'zh-Hans-CN'));

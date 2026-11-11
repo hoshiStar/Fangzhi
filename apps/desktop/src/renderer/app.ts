@@ -1,6 +1,6 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import type { PDFDocumentLoadingTask, PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
-import type { BookHit, BookRecord, Facets, FileRecord, SearchResult, SearchFilters } from '@fangzhi/core';
+import type { BookHit, BookOverride, BookOverrideFields, BookRecord, Facets, FileRecord, SearchResult, SearchFilters } from '@fangzhi/core';
 import { formatSize } from '@fangzhi/core';
 
 // worker 由 build.mjs 拷到 dist/renderer 下，和 index.html 同级。
@@ -9,21 +9,23 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.min.mjs';
 declare global {
   interface Window {
     fz: {
-      info(): Promise<{ dataDir: string; hasIndex: boolean; meta?: { shareTitle: string; shareUrl?: string; author?: string }; stats?: { fileCount: number; bookCount: number; totalSize: number }; crawledAt?: string }>;
+      info(): Promise<{ dataDir: string; hasIndex: boolean; meta?: { shareTitle: string; shareUrl?: string; author?: string }; stats?: { fileCount: number; bookCount: number; totalSize: number }; searchableBookCount?: number; crawledAt?: string }>;
       search(q: string, filters: SearchFilters, limit: number, offset: number): Promise<SearchResult>;
-      book(id: string): Promise<{ book: BookRecord; files: FileRecord[] } | undefined>;
+      book(id: string): Promise<{ book: BookRecord; files: FileRecord[]; override?: BookOverride } | undefined>;
+      bookOverrideSet(id: string, patch: BookOverrideFields): Promise<{ ok: boolean; error?: string; applied?: number }>;
       facets(): Promise<Facets>;
       crawl(url: string, resume: boolean): Promise<{ ok: boolean; error?: string; aborted?: boolean; canResume?: boolean; diff?: { added: number; removed: number; changed: number } }>;
       cancelCrawl(): Promise<boolean>;
       pickDataDir(): Promise<{ ok: boolean; error?: string }>;
       openExternal(url: string): Promise<boolean>;
-      cookieInfo(): Promise<{ has: boolean; names: string[]; bytes: number }>;
-      cookieSet(raw: string): Promise<{ ok: boolean; error?: string; has?: boolean; names?: string[]; bytes?: number }>;
-      cookieClear(): Promise<{ has: boolean; names: string[]; bytes: number }>;
+      cookieInfo(): Promise<{ has: boolean; names: string[]; bytes: number; encryptionAvailable: boolean }>;
+      cookieSet(raw: string): Promise<{ ok: boolean; error?: string; has?: boolean; names?: string[]; bytes?: number; encryptionAvailable?: boolean }>;
+      cookieClear(): Promise<{ has: boolean; names: string[]; bytes: number; encryptionAvailable: boolean }>;
       cookieTest(): Promise<{ ok: boolean; message: string }>;
       dlList(): Promise<DlState[]>;
-      dlEnqueue(items: Array<{ fid: string; name: string; size: number; pdirFid: string; shareFidToken: string }>): Promise<DlState[]>;
+      dlEnqueue(items: Array<{ fid: string; bookId: string; name: string; size: number; pdirFid: string; shareFidToken: string }>): Promise<DlState[]>;
       dlCancel(fid?: string): Promise<DlState[]>;
+      dlRetry(fid: string): Promise<DlState[]>;
       dlInfo(): Promise<{ dir: string }>;
       dlDir(): Promise<{ ok: boolean; dir: string }>;
       showInFolder(p: string): Promise<boolean>;
@@ -36,6 +38,8 @@ declare global {
         total: number;
         books: Array<{ bookId: string; title: string; count: number; files: Array<{ fid: string; name: string; count: number; pages: Array<{ p: number; n: number }>; snippet: string; marks: Array<[number, number]> }> }>;
       }>;
+      ocrSummary(): Promise<{ totalFiles: number; textFiles: number; doneFiles: number; doneBooks: number; totalBooks: number }>;
+      openOcrFolder(): Promise<{ ok: boolean; dir?: string; error?: string }>;
       onCrawlProgress(cb: (p: { dirsDone: number; dirsPending: number; files: number; reqCount: number; currentPath: string }) => void): () => void;
       onDlProgress(cb: (p: DlState) => void): () => void;
     };
@@ -57,11 +61,14 @@ const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) 
 
 const state = {
   q: '',
-  filters: { provinces: [], eras: [], zhiTypes: [], exts: [] } as SearchFilters & { provinces: string[]; eras: string[]; zhiTypes: string[]; exts: string[] },
+  filters: { provinces: [], eras: [], zhiTypes: [], exts: [], allTermsOnly: false } as SearchFilters & { provinces: string[]; eras: string[]; zhiTypes: string[]; exts: string[]; allTermsOnly: boolean },
   offset: 0,
   selected: '',
   crawling: false,
   shareUrl: '',
+  ocrTotalFiles: 0,
+  ocrTextFiles: 0,
+  ocrDoneFiles: 0,
 };
 
 /** 文件名来自网盘，是不可信输入，插值前必须转义。 */
@@ -109,6 +116,7 @@ function renderFacets(f: Facets): void {
       el.classList.toggle('on');
       $('btn-reset').classList.toggle('hidden', !hasFilters());
       state.offset = 0;
+      clearSelection();
       run();
     };
   }
@@ -117,6 +125,12 @@ function renderFacets(f: Facets): void {
 function hasFilters(): boolean {
   const f = state.filters;
   return !!(f.provinces?.length || f.eras?.length || f.zhiTypes?.length || f.exts?.length);
+}
+
+function clearSelection(): void {
+  state.selected = '';
+  $('detail').classList.add('hidden');
+  $('detail').innerHTML = '';
 }
 
 function bookMeta(b: BookRecord): string[] {
@@ -130,6 +144,8 @@ function bookMeta(b: BookRecord): string[] {
   out.push(`${b.fileCount} 册`);
   out.push(formatSize(b.totalSize));
   if (b.ocrDone) out.push(`已识别 ${b.ocrDone}`);
+  if (b.verified) out.push('已校正');
+  else if (b.confidence < 0.4) out.push('待核对');
   return out;
 }
 
@@ -139,20 +155,29 @@ function renderResults(r: SearchResult): void {
     list.innerHTML = `<div class="empty">没有匹配的书。<br>试试只输地名（如「莆田」），或清掉左侧筛选。</div>`;
     $('summary').innerHTML = '';
     $('pager').innerHTML = '';
+    clearSelection();
     return;
   }
 
+  const weakNote = r.weakTotal > 0
+    ? ` · 另有 ${r.weakTotal} 条部分/近似${r.weakShown < r.weakTotal ? `（保留 ${r.weakShown} 条）` : ''}`
+    : '';
+  const mainCount = r.directTotal > 0
+    ? `直接命中 <b>${r.directTotal}</b> 部书`
+    : `部分/近似命中 <b>${r.total}</b> 部书`;
   $('summary').innerHTML =
-    `命中 <b>${r.total}</b> 部书 · ${r.elapsedMs}ms` +
+    `${mainCount}${r.available < r.total ? ` · 可浏览 ${r.available} 部` : ''} · ${r.elapsedMs}ms` +
     (state.q ? ` · 查询「${esc(state.q)}」` : ' · 浏览全部') +
-    (hasFilters() ? ' · 已筛选' : '');
+    (state.filters.allTermsOnly ? ' · 全部词严格匹配' : '') +
+    (hasFilters() ? ' · 已筛选' : '') + weakNote;
 
   list.innerHTML = r.items.map((h: BookHit) => {
     const b = h.book;
+    const quality = h.match === 'partial' || h.match === 'fuzzy' ? ' fuzzy' : '';
     return `<div class="book${b.id === state.selected ? ' on' : ''}" data-id="${b.id}">
       <div class="t">${hl(b.title, state.q)}</div>
       <div class="m">${bookMeta(b).map((x) => `<span>${esc(x)}</span>`).join('')}
-        <span>${h.matched.map((m) => `<i class="tag${h.direct ? '' : ' fuzzy'}">${esc(m)}</i>`).join(' ')}</span>
+        <span>${h.matched.map((m) => `<i class="tag${quality}">${esc(m)}</i>`).join(' ')}</span>
       </div>
     </div>`;
   }).join('');
@@ -162,7 +187,7 @@ function renderResults(r: SearchResult): void {
     if (el) selectBook(el.dataset.id!);
   };
 
-  const pages = Math.ceil(r.total / PAGE);
+  const pages = Math.ceil(r.available / PAGE);
   const cur = Math.floor(state.offset / PAGE) + 1;
   $('pager').innerHTML = pages > 1
     ? `<button id="prev"${cur <= 1 ? ' disabled' : ''}>上一页</button>
@@ -197,14 +222,23 @@ async function selectBook(id: string): Promise<void> {
       ${b.author ? `<div>著录 <b>${esc(b.author)}</b></div>` : ''}
       ${b.edition ? `<div>版本 <b>${esc(b.edition)}</b></div>` : ''}
       ${b.catalogRaw ? `<div>原串 <b>${esc(b.catalogRaw)}</b></div>` : ''}
-      <div>置信度 <b>${b.confidence.toFixed(2)}</b> · ${b.fileCount} 册 · ${formatSize(b.totalSize)}</div>
+      <div>置信度 <b>${b.confidence.toFixed(2)}</b> · ${b.fileCount} 册 · ${formatSize(b.totalSize)}
+        ${b.verified ? '<i class="tag ok">已人工校正</i>' : b.confidence < 0.4 ? '<i class="tag fuzzy">待核对</i>' : ''}</div>
     </div>
     <div class="acts">
       <button id="d-share" class="primary">在夸克打开分享页</button>
       <button id="d-dl">下载本书</button>
+      <button id="d-edit" class="ghost">校正书目</button>
     </div>
     <h3>文件</h3>
-    ${d.files.map((f) => `<div class="file">${f.ext === 'pdf' && !f.isArchivePart ? `<button class="read" data-fid="${esc(f.fid)}">阅读</button>` : ''}<span class="s">${formatSize(f.size)}</span>${hl(f.name, state.q)}${f.volume ? ` <i class="tag">${esc(f.volume)}</i>` : ''}${f.section ? ` <i class="tag">${esc(f.section)}</i>` : ''}${f.isArchivePart ? ' <i class="tag fuzzy">分卷</i>' : ''}</div>`).join('')}
+    ${d.files.map((f) => `<div class="file">
+      ${f.ext === 'pdf' && !f.isArchivePart ? `<button class="read" data-fid="${esc(f.fid)}">阅读</button>` : ''}
+      ${!f.isNoise && !f.isArchivePart ? `<button class="dlone ghost" data-fid="${esc(f.fid)}">下载</button>` : ''}
+      <span class="s">${formatSize(f.size)}</span>${hl(f.name, state.q)}
+      ${f.volume ? ` <i class="tag">${esc(f.volume)}</i>` : ''}
+      ${f.section ? ` <i class="tag">${esc(f.section)}</i>` : ''}
+      ${f.isArchivePart ? ' <i class="tag fuzzy">分卷</i>' : ''}
+    </div>`).join('')}
   `;
   const btn = panel.querySelector<HTMLButtonElement>('#d-share');
   if (btn && state.shareUrl) btn.onclick = () => window.fz.openExternal(state.shareUrl);
@@ -218,12 +252,21 @@ async function selectBook(id: string): Promise<void> {
       if (local.length) dlBtn.textContent = '更新本书';
     });
   }
+  const editBtn = panel.querySelector<HTMLButtonElement>('#d-edit');
+  if (editBtn) editBtn.onclick = () => overrideModal(b, d.override);
   panel.querySelectorAll<HTMLButtonElement>('.file .read').forEach((el) => {
     el.addEventListener('click', (ev) => {
       ev.stopPropagation();
       const fid = el.dataset.fid!;
       const rec = d.files.find((x) => x.fid === fid);
       void openReader(fid, rec?.name ?? '');
+    });
+  });
+  panel.querySelectorAll<HTMLButtonElement>('.file .dlone').forEach((el) => {
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const rec = d.files.find((x) => x.fid === el.dataset.fid);
+      if (rec) void enqueueBook([rec]);
     });
   });
 }
@@ -256,7 +299,10 @@ async function renderTextHits(q: string, mine: number): Promise<void> {
   const r = await window.fz.searchText(q);
   if (token !== textRunSeq || mine !== runSeq) return;
   if (!r.books.length) {
-    box.innerHTML = '<div class="thead">全文没有命中</div>';
+    const coverage = state.ocrTextFiles
+      ? `当前全文库覆盖 ${state.ocrTextFiles}/${state.ocrTotalFiles} 个文件，未命中不代表原书没有该内容。`
+      : '当前还没有任何 OCR 全文数据，全文检索不可用；书名检索不受影响。';
+    box.innerHTML = `<div class="thead">全文没有命中</div><div class="thint">${esc(coverage)}</div>`;
     box.classList.remove('hidden');
     return;
   }
@@ -281,6 +327,7 @@ async function renderTextHits(q: string, mine: number): Promise<void> {
 let timer: ReturnType<typeof setTimeout> | undefined;
 function scheduleRun(): void {
   clearTimeout(timer);
+  clearSelection();
   timer = setTimeout(() => { state.offset = 0; run(); }, 160);
 }
 
@@ -349,14 +396,15 @@ function closeModal(): void {
 
 async function cookieModal(hint = ''): Promise<void> {
   const info = await window.fz.cookieInfo();
+  const canSave = info.encryptionAvailable;
   const card = openModal(`
     <h2>夸克账号 cookie</h2>
     <p>下载要走你自己的登录态：浏览器登录 pan.quark.cn，F12 → Network 里随便点一个 drive-pc.quark.cn 的请求，复制请求头里的 Cookie 整串粘进来。</p>
-    <p>cookie 只用系统密钥加密后存在本机，不上传、也不进索引目录。</p>
-    <div class="row"><span class="msg ${info.has ? 'ok' : ''}">${info.has ? `已配置 ${info.bytes} 字符：${esc(info.names.join(' '))}` : '未配置'}</span></div>
+    <p>cookie 只在系统密钥服务可用时加密保存在本机，不上传、也不进索引目录。${canSave ? '' : '<strong>当前系统密钥服务不可用，出于安全考虑不会保存明文 cookie。</strong>'}</p>
+    <div class="row"><span class="msg ${info.has ? 'ok' : canSave ? '' : 'err'}">${info.has ? `已配置 ${info.bytes} 字符：${esc(info.names.join(' '))}` : canSave ? '未配置' : '未配置 · 系统密钥服务不可用'}</span></div>
     <textarea id="k-raw" spellcheck="false" placeholder="__puus=...; __pus=...; __pugs=..."></textarea>
     <div class="row">
-      <button id="k-save" class="primary">保存</button>
+      <button id="k-save" class="primary"${canSave ? '' : ' disabled'}>保存</button>
       <button id="k-test" class="ghost">测试登录</button>
       <button id="k-clear" class="ghost">清除</button>
       <button id="k-close" class="ghost">关闭</button>
@@ -382,6 +430,84 @@ async function cookieModal(hint = ''): Promise<void> {
     msg.textContent = '已清除';
   });
   card.querySelector('#k-close')!.addEventListener('click', closeModal);
+}
+
+/* ---------- 书目人工校正 ---------- */
+function overrideModal(book: BookRecord, override?: BookOverride): void {
+  const current = { ...book, ...(override ?? {}) };
+  const field = (key: keyof BookOverrideFields, label: string): string => `
+    <label><span>${label}</span><input id="o-${key}" value="${esc(String(current[key] ?? ''))}" autocomplete="off" spellcheck="false" /></label>`;
+  const card = openModal(`
+    <h2>校正书目</h2>
+    <p>校正只保存在本机，不修改原始索引；爬取更新后仍会按书目成员文件重新应用。留空表示清除该字段。</p>
+    <div class="editgrid">
+      ${field('title', '书名主干')}
+      ${field('era', '朝代 / 年号')}
+      ${field('place', '地名')}
+      ${field('zhiType', '志种')}
+      ${field('province', '省区')}
+      ${field('author', '著录 / 作者')}
+      ${field('edition', '版本')}
+    </div>
+    <div class="row">
+      <button id="o-save" class="primary">保存校正</button>
+      <button id="o-close" class="ghost">取消</button>
+      <span id="o-msg" class="msg"></span>
+    </div>`);
+  const msg = card.querySelector<HTMLSpanElement>('#o-msg')!;
+  card.querySelector('#o-close')!.addEventListener('click', closeModal);
+  card.querySelector('#o-save')!.addEventListener('click', async () => {
+    const keys: Array<keyof BookOverrideFields> = [
+      'title', 'era', 'place', 'zhiType', 'province', 'author', 'edition',
+    ];
+    const patch: BookOverrideFields = {};
+    for (const key of keys) {
+      const value = card.querySelector<HTMLInputElement>(`#o-${key}`)!.value.trim();
+      const original = String(book[key] ?? '').trim();
+      // 只保存真正改过的字段，避免把未改动的人工结果锁死，挡住后续解析规则升级。
+      if (value !== original) patch[key] = value;
+    }
+    msg.className = 'msg';
+    msg.textContent = '保存中…';
+    const r = await window.fz.bookOverrideSet(book.id, patch);
+    if (!r.ok) {
+      msg.className = 'msg err';
+      msg.textContent = r.error ?? '保存失败';
+      return;
+    }
+    closeModal();
+    await run();
+    await selectBook(book.id);
+  });
+}
+
+/* ---------- 全文识别覆盖 ---------- */
+async function ocrModal(): Promise<void> {
+  const s = await window.fz.ocrSummary();
+  state.ocrTotalFiles = s.totalFiles;
+  state.ocrTextFiles = s.textFiles;
+  state.ocrDoneFiles = s.doneFiles;
+  const pct = s.totalFiles ? Math.round((s.textFiles / s.totalFiles) * 100) : 0;
+  const card = openModal(`
+    <h2>全文识别</h2>
+    <p>全文检索来自本机 OCR 文本。当前覆盖 <b>${s.textFiles}/${s.totalFiles}</b> 个文件，
+      完成 <b>${s.doneFiles}</b> 个文件、<b>${s.doneBooks}/${s.totalBooks}</b> 部书。</p>
+    <div class="ocrbar"><i style="width:${pct}%"></i></div>
+    <p>未覆盖的书仍可按书名、地名、志种检索和阅读 PDF；全文无结果不能解释为原书没有该内容。</p>
+    <p>识别任务需要 Python/uv 环境，桌面端暂不内置识别运行时。下载 PDF 后可在开发工具环境执行：</p>
+    <pre>uv run tools/ocr/ocr.py --dir "下载目录" --limit 20</pre>
+    <div class="row">
+      <button id="o-open" class="primary">打开 OCR 数据目录</button>
+      <button id="o-close" class="ghost">关闭</button>
+      <span id="o-note" class="msg"></span>
+    </div>`);
+  card.querySelector('#o-close')!.addEventListener('click', closeModal);
+  card.querySelector('#o-open')!.addEventListener('click', async () => {
+    const r = await window.fz.openOcrFolder();
+    const note = card.querySelector<HTMLSpanElement>('#o-note')!;
+    note.className = 'msg ' + (r.ok ? 'ok' : 'err');
+    note.textContent = r.ok ? '已打开' : (r.error ?? '打开失败');
+  });
 }
 
 /* ---------- 下载队列 ---------- */
@@ -421,7 +547,9 @@ function renderDl(): void {
             <div class="n" title="${esc(s.name)}">${esc(s.name)}</div>
             <span class="bar"><i style="width:${s.status === 'done' ? 100 : pct}%"></i></span>
             <div class="r"><span class="${s.status === 'error' ? 'err' : s.status === 'done' ? 'ok' : ''}">${esc(note)}</span>
-              ${busy ? '<button data-act="cancel">取消</button>' : s.dest ? '<button data-act="show">打开位置</button>' : ''}
+              ${busy ? '<button data-act="cancel">取消</button>' : ''}
+              ${s.status === 'error' ? '<button data-act="retry">重试</button>' : ''}
+              ${s.dest ? '<button data-act="show">打开位置</button>' : ''}
             </div></div>`;
         }).join('')
       : '<div class="empty">队列为空。<br>在右侧书详情里点「下载本书」。</div>');
@@ -436,7 +564,12 @@ function renderDl(): void {
     b.addEventListener('click', () => {
       const fid = (b.closest('.dlitem') as HTMLElement).dataset.fid!;
       if (b.dataset.act === 'cancel') void window.fz.dlCancel(fid);
-      else {
+      else if (b.dataset.act === 'retry') {
+        void window.fz.dlRetry(fid).then((list) => {
+          for (const s of list) dl.set(s.fid, s);
+          renderDl();
+        });
+      } else {
         const dest = dl.get(fid)?.dest;
         if (dest) void window.fz.showInFolder(dest);
       }
@@ -449,7 +582,7 @@ async function enqueueBook(files: FileRecord[]): Promise<void> {
   if (!ci.has) { void cookieModal('先配置 cookie 才能下载。'); return; }
   const items = files
     .filter((f) => !f.isNoise && f.shareFidToken)
-    .map((f) => ({ fid: f.fid, name: f.name, size: f.size, pdirFid: f.pdirFid, shareFidToken: f.shareFidToken }));
+    .map((f) => ({ fid: f.fid, bookId: f.bookId, name: f.name, size: f.size, pdirFid: f.pdirFid, shareFidToken: f.shareFidToken }));
   if (!items.length) return;
   for (const s of await window.fz.dlEnqueue(items)) dl.set(s.fid, s);
   $('dltray').classList.remove('hidden');
@@ -480,6 +613,11 @@ let readerHitIdx = -1;
 let readerQuery = '';
 
 const readerLimit = (): number => (readerMode === 'ocr' ? readerOcrPages : readerDoc?.numPages ?? 0);
+const posKey = (fid: string): string => `fz:last-page:${fid}`;
+const savedPage = (fid: string): number => {
+  const n = Number(localStorage.getItem(posKey(fid)));
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+};
 
 function readerMsg(text: string, err = false): void {
   const msg = $('r-msg');
@@ -522,6 +660,7 @@ async function renderReaderPage(n: number): Promise<void> {
 
     readerPage = no;
     $<HTMLInputElement>('r-page').value = String(no);
+    if (readerFid) localStorage.setItem(posKey(readerFid), String(no));
   } catch (e) {
     // 翻页太快会取消上一次渲染，这不是错误
     if ((e as Error).name === 'RenderingCancelledException') return;
@@ -538,6 +677,7 @@ async function renderOcrPage(n: number): Promise<void> {
   if (readerMode !== 'ocr') return;
   readerPage = no;
   $<HTMLInputElement>('r-page').value = String(no);
+  if (readerFid) localStorage.setItem(posKey(readerFid), String(no));
   $('r-msg').classList.add('hidden');
   $<HTMLCanvasElement>('r-canvas').classList.add('hidden');
   const box = $('r-text');
@@ -628,7 +768,13 @@ async function closeReader(): Promise<void> {
   if (task) await task.destroy().catch(() => undefined);
 }
 
-async function showReader(url: string, name: string, mode: 'local' | 'online', fid: string): Promise<void> {
+async function showReader(
+  url: string,
+  name: string,
+  mode: 'local' | 'online',
+  fid: string,
+  ocrOnly = false,
+): Promise<void> {
   const seq = ++readerSeq;
   $('reader').classList.remove('hidden');
   $('r-title').textContent = name;
@@ -672,6 +818,14 @@ async function showReader(url: string, name: string, mode: 'local' | 'online', f
   readerTask = null;
   if (stale) await stale.destroy().catch(() => undefined);
 
+  // PDF 暂时打不开（例如没有 cookie）时，已有 OCR 文本仍可进入阅读。
+  if (ocrOnly && readerOcrPages) {
+    $('r-mode').textContent = '仅 OCR 文本';
+    readerPage = Math.min(savedPage(fid), readerOcrPages);
+    setReaderMode('ocr');
+    return;
+  }
+
   try {
     const task = pdfjsLib.getDocument({
       url,
@@ -688,7 +842,8 @@ async function showReader(url: string, name: string, mode: 'local' | 'online', f
     $('r-total').textContent = `/ ${doc.numPages}`;
     readerFit = true;
     $('r-fit').textContent = '适应宽度';
-    await renderReaderPage(1);
+    readerPage = Math.min(savedPage(fid), doc.numPages);
+    await renderReaderPage(readerPage);
   } catch (e) {
     if (seq !== readerSeq) return;
     readerMsg(`打不开这个 PDF：${(e as Error).message}`, true);
@@ -699,7 +854,25 @@ async function showReader(url: string, name: string, mode: 'local' | 'online', f
 async function openReader(fid: string, name: string, at?: { page: number; q: string }): Promise<void> {
   const r = await window.fz.readerResolve(fid);
   if (!r.ok) {
-    if (r.needCookie) { void cookieModal('在线阅读需要夸克 cookie（已下载到本地的文件不需要）。'); return; }
+    if (r.needCookie) {
+      const oi = await window.fz.ocrInfo(fid);
+      if (oi.ok && oi.pages) {
+        await showReader('', name, 'local', fid, true);
+        if (at) {
+          const res = await window.fz.ocrSearch(fid, at.q);
+          readerQuery = at.q;
+          readerHits = res.hits;
+          readerHitIdx = readerHits.findIndex((h) => h.p === at.page);
+          $<HTMLInputElement>('r-q').value = at.q;
+          $('r-hits').classList.remove('hidden');
+          $('r-hits').textContent = `${Math.max(1, readerHitIdx + 1)}/${res.hits.length} 页 · 共 ${res.total} 处`;
+          await renderOcrPage(at.page);
+        }
+        return;
+      }
+      void cookieModal('在线阅读需要夸克 cookie（已下载到本地的文件不需要）。');
+      return;
+    }
     alert(r.error ?? '打不开这个文件');
     return;
   }
@@ -770,8 +943,20 @@ async function boot(): Promise<void> {
   $('subtitle').textContent = label;
   $('subtitle').title = label;
   $('status-left').textContent = info.dataDir;
+  const searchable = info.searchableBookCount ?? s.bookCount;
+  const bookLabel = searchable === s.bookCount
+    ? `${s.bookCount} 部书`
+    : `${s.bookCount} 部书（${searchable} 部可检索）`;
+  const ocrSummary = await window.fz.ocrSummary();
+  state.ocrTotalFiles = ocrSummary.totalFiles;
+  state.ocrTextFiles = ocrSummary.textFiles;
+  state.ocrDoneFiles = ocrSummary.doneFiles;
   $('status-right').textContent =
-    `${s.fileCount} 文件 · ${s.bookCount} 部书 · ${formatSize(s.totalSize)} · 爬取于 ${new Date(info.crawledAt ?? Date.now()).toLocaleString('zh-CN')}`;
+    `${s.fileCount} 文件 · ${bookLabel} · 全文 ${ocrSummary.textFiles}/${ocrSummary.totalFiles} 文件` +
+    ` · ${formatSize(s.totalSize)} · 爬取于 ${new Date(info.crawledAt ?? Date.now()).toLocaleString('zh-CN')}`;
+
+  for (const s of await window.fz.dlList()) dl.set(s.fid, s);
+  renderDl();
 
   renderFacets(await window.fz.facets());
   await run();
@@ -784,10 +969,17 @@ $('q').addEventListener('keydown', (e) => {
 });
 $('clear').addEventListener('click', () => { const q = $<HTMLInputElement>('q'); q.value = ''; state.q = ''; q.focus(); scheduleRun(); });
 $('btn-reset').addEventListener('click', () => {
-  state.filters = { provinces: [], eras: [], zhiTypes: [], exts: [] };
+  state.filters = { provinces: [], eras: [], zhiTypes: [], exts: [], allTermsOnly: $<HTMLInputElement>('strict').checked };
   $('btn-reset').classList.add('hidden');
   state.offset = 0;
+  clearSelection();
   boot();
+});
+$<HTMLInputElement>('strict').addEventListener('change', (e) => {
+  state.filters.allTermsOnly = (e.target as HTMLInputElement).checked;
+  state.offset = 0;
+  clearSelection();
+  run();
 });
 $('btn-crawl').addEventListener('click', crawlModal);
 $('btn-facets').addEventListener('click', () => $('facets').classList.toggle('collapsed'));
@@ -796,7 +988,11 @@ for (const h of document.querySelectorAll<HTMLElement>('.facets section > h2')) 
   h.title = '点击收起 / 展开';
   h.addEventListener('click', () => h.parentElement?.classList.toggle('collapsed'));
 }
+for (const b of document.querySelectorAll<HTMLElement>('.toolmenu button')) {
+  b.addEventListener('click', () => b.closest('details')?.removeAttribute('open'));
+}
 $('btn-cookie').addEventListener('click', () => void cookieModal());
+$('btn-ocr').addEventListener('click', () => void ocrModal());
 $('btn-dl').addEventListener('click', async () => {
   const tray = $('dltray');
   if (tray.classList.contains('hidden')) {

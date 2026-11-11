@@ -9,7 +9,7 @@
     uv run tools/ocr/ocr.py --dir "C:/Users/<你>/Downloads/方志检索" [--limit 20]
 
     # 单本：指定 PDF，可限页数先冒烟
-    uv run tools/ocr/ocr.py --pdf "C:/.../嘉靖赣州府志.pdf" [--max-pages 3] [--lang chs] [--vertical off]
+    uv run tools/ocr/ocr.py --pdf "C:/.../嘉靖赣州府志.pdf" [--max-pages 3] [--lang v6s] [--vertical off]
 
     # 重跑已识别过的页（改算法后复测用）
     uv run tools/ocr/ocr.py --dir "..." --limit 10 --max-pages 6 --force
@@ -21,6 +21,7 @@
 
 - `p` 从 1 开始；`b` 是 [x0,y0,x1,y1]，坐标基于该页按 `dpi` 渲染后的像素；
 - `text` 是 `lines` 按识别顺序拼起来的整页文本，供检索用；
+- 竖排页的 `t` 已经过异体字归一（寿→壽、晋→晉、属→屬 等），横排页保持原样；
 - 空页也写一行（text 为空），这样续跑时不重复识别。
 
 索引里只记相对引用（`ocr/<fid>.jsonl`），索引体积不涨。重跑安全：
@@ -42,11 +43,44 @@ from rapidocr_onnxruntime import RapidOCR
 
 REPO = Path(__file__).resolve().parents[2]
 SANITIZE = re.compile(r'[\\/:*?"<>|]')
-CHT_MODEL = Path(__file__).resolve().parent / 'models' / 'chinese_cht_PP-OCRv3_rec_mobile.onnx'
-CHT_URL = ('https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/'
-           'onnx/PP-OCRv4/rec/chinese_cht_PP-OCRv3_rec_mobile.onnx')
+MODELS_DIR = Path(__file__).resolve().parent / 'models'
+# 识别模型。PP-OCRv5/v6 的 onnx 把字典写在 metadata 里（3.6 万+字，简繁/生僻字都在），
+# 换模型只要换 rec_model_path，不用再配 keys 文件。v6 small 实测在木刻竖排上
+# 错字率 9.9%，比 v6 medium（13.0%，123 秒/页）又准又快，所以默认用它。
+REC_MODELS = {
+    'v6s': ('PP-OCRv6_rec_small.onnx',
+            'onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx'),
+    'v5m': ('ch_PP-OCRv5_rec_mobile.onnx',
+            'onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile.onnx'),
+    'v5s': ('ch_PP-OCRv5_rec_server.onnx',
+            'onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_server.onnx'),
+    'cht': ('chinese_cht_PP-OCRv3_rec_mobile.onnx',
+            'onnx/PP-OCRv4/rec/chinese_cht_PP-OCRv3_rec_mobile.onnx'),
+}
+MODEL_BASE = 'https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/'
 # 每页平均字符数超过这个值就认为 PDF 自带字层，直接抄文本、不跑模型
 TEXT_LAYER_MIN = 30
+# 竖排一列字切成单字后横排拼接时，字间留的白缝（按列宽比例）。不留缝 CTC 容易把
+# 相邻两字认成一个；留太宽又会凭空多字，实测 0.06 列宽最好。
+CHAR_GAP_RATIO = 0.06
+# 异体字/俗字归一：OCR 对木刻俗字常吐「寿、晋、属」这类简体形，而索引和用户检索词
+# 都是正字（「延壽」「晉昌」），不归一就搜不到。只做一一映射、不碰形近字纠错。
+# 只对竖排页生效：简体出版物基本都是横排，套上去会把「寿」「万」改坏。
+VARIANT_MAP = str.maketrans({
+    '寿': '壽', '晋': '晉', '属': '屬', '万': '萬', '与': '與', '为': '為', '会': '會',
+    '国': '國', '图': '圖', '学': '學', '实': '實', '众': '眾', '户': '戶', '争': '爭',
+    '决': '決', '净': '淨', '减': '減', '册': '冊', '吴': '吳', '吕': '呂', '宫': '宮',
+    '岛': '島', '贰': '貳', '别': '別', '叙': '敘', '参': '參', '耻': '恥', '絶': '絕',
+    '峯': '峰', '羣': '群', '敎': '教', '眞': '真', '竝': '並', '倂': '並', '卽': '即',
+    '旣': '既', '槪': '概', '畧': '略', '畱': '留', '况': '況', '凉': '涼', '凑': '湊',
+    '厨': '廚', '厠': '廁', '厦': '廈', '竪': '豎', '却': '卻', '刦': '劫', '刧': '劫',
+})
+
+
+def _normalize_variants(lines: list[dict]) -> None:
+    """把异体/俗字改成通行繁体正字（原地改 lines 里的 t）。"""
+    for ln in lines:
+        ln['t'] = ln['t'].translate(VARIANT_MAP)
 
 
 def local_name(name: str) -> str:
@@ -65,17 +99,26 @@ def page_image(page: fitz.Page, dpi: int) -> np.ndarray:
     return np.ascontiguousarray(img[:, :, ::-1])
 
 
-def ensure_cht_model() -> Path:
-    """繁体识别模型（chinese_cht）。放仓库外太大，首次使用时从 ModelScope 下到 tools/ocr/models。"""
-    if CHT_MODEL.is_file() and CHT_MODEL.stat().st_size > 1_000_000:
-        return CHT_MODEL
-    CHT_MODEL.parent.mkdir(parents=True, exist_ok=True)
-    print(f'下载繁体模型 -> {CHT_MODEL}（约 11MB，只需一次）', flush=True)
-    tmp = CHT_MODEL.with_suffix('.part')
-    with urllib.request.urlopen(CHT_URL, timeout=180) as resp, tmp.open('wb') as fh:
+def ensure_model(name: str) -> Path:
+    """取识别模型。模型放仓库外太大，首次使用时从 ModelScope 下到 tools/ocr/models。"""
+    fname, rel = REC_MODELS[name]
+    path = MODELS_DIR / fname
+    if path.is_file() and path.stat().st_size > 1_000_000:
+        return path
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f'下载识别模型 {fname} -> {path}（只需一次）', flush=True)
+    tmp = path.with_suffix('.part')
+    with urllib.request.urlopen(MODEL_BASE + rel, timeout=600) as resp, tmp.open('wb') as fh:
         shutil.copyfileobj(resp, fh)
-    tmp.replace(CHT_MODEL)
-    return CHT_MODEL
+    tmp.replace(path)
+    return path
+
+
+def engine_for(lang: str) -> RapidOCR:
+    """识别引擎。模型按 lang 延迟加载（每个约 100-300MB 内存），调用方自己缓存。"""
+    if lang == 'chs':
+        return RapidOCR()  # 旧的内置简体模型，留作对照
+    return RapidOCR(rec_model_path=str(ensure_model(lang)))
 
 
 def _to_lines(result) -> list[dict]:
@@ -144,30 +187,49 @@ def _is_tall(box: list[int]) -> bool:
 
 
 def _split_chars(img: np.ndarray, b: list[int]) -> list[np.ndarray]:
-    """一列竖排字按字数等分切块；边界在等分点附近吸附到墨迹最少的行。
+    """一列竖排字切成单字：按墨迹投影做 DP，找「切缝处墨量最低、每段高度 ∈ [0.6, 1.3] 列宽」的切法。
 
-    不能按「字内空白行」下刀：上下结构的字（寰、壽、暑）中间本来就有空白，
-    会被劈成两个假字，识别出来就是 1-2 个错字（实测「寰」→「齒衣」）。
+    不能按等分切：列宽只是字高的粗略估计，多估一个字就会把「寰」劈成「血衣」，
+    少估一个就会把两个字并成一个（实测等分 25.5% → DP 9.9%）。也不按「字内空白行」
+    下刀：上下结构的字（寰、壽、暑）中间本来就有空白，会被劈成两个假字。
     """
     x0, y0, x1, y1 = b
     crop = img[y0:y1, x0:x1]
     if crop.size == 0:
         return []
     h, w = crop.shape[:2]
-    # 竖排单字近方形，列宽可以当字高用；这比数字数更稳，也不依赖字间是否粘连
-    n = max(1, min(60, int(round(h / max(1, w)))))
-    step = h / n
-    if n == 1:
+    if h < 4 or w < 4 or h <= w * 0.6:
         return [crop]
-    ink = (crop.mean(axis=2) < 160).sum(axis=1).astype(np.float32)
-    cuts = [0]
-    for k in range(1, n):
-        target = int(k * step)
-        lo = max(1, int(target - step * 0.3))
-        hi = min(h - 1, int(target + step * 0.3))
-        cuts.append(lo + int(np.argmin(ink[lo:hi])) if hi > lo else target)
-    cuts.append(h)
-    return [crop[a:b] for a, b in zip(cuts, cuts[1:]) if b - a >= 3]
+    ink = (crop.mean(axis=2) < 150).mean(axis=1).astype(np.float32)
+    if h > 5:
+        ink = np.convolve(ink, np.ones(3, np.float32) / 3, 'same')
+    lmin, lmax = max(3, int(0.6 * w)), max(4, int(1.3 * w))
+    inf = 1e9
+    cost = [inf] * (h + 1)
+    prev = [-1] * (h + 1)
+    cost[0] = 0.0
+    for end in range(lmin, h + 1):
+        best, arg = inf, -1
+        # 切在 end 处的代价：切缝本身的墨量（行越白越好）+ 每多切一刀的固定惩罚
+        cut = float(ink[end - 1]) if end < h else 0.0
+        for seg in range(lmin, lmax + 1):
+            start = end - seg
+            if start < 0 or cost[start] >= inf:
+                continue
+            c = cost[start] + cut + 0.01
+            if c < best:
+                best, arg = c, start
+        cost[end], prev[end] = best, arg
+    if cost[h] >= inf:
+        return [crop]
+    cuts = [h]
+    i = h
+    while prev[i] > 0:
+        i = prev[i]
+        cuts.append(i)
+    cuts.append(0)
+    cuts.sort()
+    return [crop[a:b_] for a, b_ in zip(cuts, cuts[1:]) if b_ - a >= 3]
 
 
 def _y_bands(lines: list[dict]) -> list[list[dict]]:
@@ -194,6 +256,22 @@ def _y_bands(lines: list[dict]) -> list[list[dict]]:
     return bands
 
 
+def _compose(pieces: list[np.ndarray], gap_ratio: float = CHAR_GAP_RATIO) -> np.ndarray:
+    """单字横排拼成一条：字与字之间留白缝，供 CTC 断字。"""
+    height = max(p.shape[0] for p in pieces)
+    gap = max(2, int(round(float(np.median([p.shape[1] for p in pieces])) * gap_ratio)))
+    row: list[np.ndarray] = []
+    for p in pieces:
+        if p.shape[0] < height:
+            pad = np.full((height - p.shape[0], p.shape[1], 3), 255, np.uint8)
+            p = np.vstack([p, pad])
+        row.append(p)
+        # 字间留一条白缝：不留缝时 CTC 会把相邻两字认成一个字（少字），
+        # 留白后模型能靠空隙断字。空白本身不会被识别成字，不用担心多字。
+        row.append(np.full((height, gap, 3), 255, np.uint8))
+    return np.hstack(row)
+
+
 def _vertical_columns(img: np.ndarray, lines: list[dict]) -> list[dict]:
     """竖排重排：字块按 x 重叠聚成列，列内按 y 排序，横向拼成一条供识别。"""
     groups: list[dict] = []
@@ -217,18 +295,10 @@ def _vertical_columns(img: np.ndarray, lines: list[dict]) -> list[dict]:
             pieces.extend(_split_chars(img, ln['b']))
         if not pieces:
             continue
-        height = max(p.shape[0] for p in pieces)
-        # 不插空白间隔：cth 模型会把空白识别成杂字（「興」），字块本来就是按空白切的
-        row: list[np.ndarray] = []
-        for p in pieces:
-            if p.shape[0] < height:
-                pad = np.full((height - p.shape[0], p.shape[1], 3), 255, np.uint8)
-                p = np.vstack([p, pad])
-            row.append(p)
         xs = [l['b'][0] for l in g['lines']] + [l['b'][2] for l in g['lines']]
         ys = [l['b'][1] for l in g['lines']] + [l['b'][3] for l in g['lines']]
         strips.append({
-            'img': np.hstack(row),
+            'img': _compose(pieces),
             'center': sum(g['x']) / 2,
             'box': [min(xs), min(ys), max(xs), max(ys)],
         })
@@ -267,6 +337,7 @@ def ocr_page(engine: RapidOCR, page: fitz.Page, dpi: int, vertical: str = 'auto'
             tail = sorted([l for l in other if l['b'][1] >= bottom], key=lambda l: l['b'][1])
             lines = head + cols + tail
             direction = 'v'
+            _normalize_variants(lines)
 
     return {
         'dpi': dpi,
@@ -380,9 +451,10 @@ def main() -> int:
     ap.add_argument('--fid', help='配合 --pdf 用，手动指定 fid（同名文件才需要）')
     ap.add_argument('--limit', type=int, default=20, help='批量模式下最多识别几本')
     ap.add_argument('--max-pages', type=int, default=0, help='每本最多识别几页，0 = 全部（冒烟用 3）')
-    ap.add_argument('--dpi', type=int, default=200, help='渲染 DPI，古籍建议 200 起')
-    ap.add_argument('--lang', choices=['auto', 'cht', 'chs'], default='auto',
-                    help='识别模型：auto 每本按置信度自动挑（默认）/ cht 繁体 / chs 简体')
+    ap.add_argument('--dpi', type=int, default=250, help='渲染 DPI，古籍建议 250 起')
+    ap.add_argument('--lang', choices=['auto', 'v6s', 'v5m', 'v5s', 'cht', 'chs'], default='v6s',
+                    help='识别模型：v6s（默认，PP-OCRv6 small，简繁通吃）/ v5m / v5s / cht / chs / '
+                         'auto 按置信度在 v6s+cht 间自动挑')
     ap.add_argument('--vertical', choices=['auto', 'off', 'always'], default='auto',
                     help='竖排处理：auto 按页面自动判断，off 关闭，always 强制整本竖排')
     ap.add_argument('--force', action='store_true', help='忽略已识别的页，整本重跑（改算法后复测用）')
@@ -428,10 +500,9 @@ def main() -> int:
 
     made: dict[str, RapidOCR] = {}
 
-    def engine_for(lang: str) -> RapidOCR:
-        # 两个模型都建起来约 200MB，按需延迟创建
+    def cached_engine(lang: str) -> RapidOCR:
         if lang not in made:
-            made[lang] = RapidOCR(rec_model_path=str(ensure_cht_model())) if lang == 'cht' else RapidOCR()
+            made[lang] = engine_for(lang)
         return made[lang]
 
     print(f'识别模型 {args.lang}，竖排 {args.vertical}', flush=True)
@@ -452,10 +523,10 @@ def main() -> int:
                     total = doc.page_count
                 else:
                     if args.lang == 'auto':
-                        lang = pick_lang({l: engine_for(l) for l in ('chs', 'cht')},
+                        lang = pick_lang({l: cached_engine(l) for l in ('v6s', 'cht')},
                                          doc, args.dpi, args.vertical)
                         print(f'  自动选模型：{lang}', flush=True)
-                    pages, total = ocr_file(engine_for(lang), p, out_path, args.dpi,
+                    pages, total = ocr_file(cached_engine(lang), p, out_path, args.dpi,
                                             args.max_pages, args.vertical, args.force)
             finally:
                 doc.close()

@@ -1,12 +1,11 @@
 import { protocol } from 'electron';
-import { createReadStream, existsSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { createReadStream, statSync } from 'node:fs';
 import { Readable } from 'node:stream';
 import { fetchShareToken, parseShareUrl, QuarkShareError, refreshShareFidTokens } from '@fangzhi/core/crawl';
 import type { CrawlTarget } from '@fangzhi/core/crawl';
 import { fetchDownloadLinks, QUARK_UA } from '@fangzhi/core/download';
 import type { FileRecord, GazetteerIndex } from '@fangzhi/core';
-import { sanitize } from './download.ts';
+import { downloadDest, legacyDownloadDest, localFileMatches } from './download.ts';
 
 export interface ReaderDeps {
   hasCookie(): boolean;
@@ -49,9 +48,22 @@ const json = (status: number, obj: unknown): Response =>
     headers: acao(new Headers({ 'content-type': 'application/json; charset=utf-8' })),
   });
 
-/** 本地已下载文件的路径，和下载管理器用同一条命名规则。 */
+/** 新下载文件的路径，和下载管理器使用同一条书目/文件隔离规则。 */
 export function localPath(deps: ReaderDeps, rec: FileRecord): string {
-  return join(deps.downloadDir(), sanitize(rec.name));
+  return downloadDest(deps.downloadDir(), { bookId: rec.bookId, fid: rec.fid, name: rec.name });
+}
+
+/**
+ * 找到真正属于这个 fid 的本地文件。旧版平铺目录只读兼容；
+ * 两条路径都必须通过大小校验，防止同名文件被误读成另一本书。
+ */
+export function findLocalPath(deps: ReaderDeps, rec: FileRecord): string {
+  const candidates = [
+    localPath(deps, rec),
+    legacyDownloadDest(deps.downloadDir(), { bookId: rec.bookId, fid: rec.fid, name: rec.name }),
+  ];
+  for (const p of candidates) if (localFileMatches(p, rec.size)) return p;
+  return '';
 }
 
 export function createReader(deps: ReaderDeps): (req: Request) => Promise<Response> {
@@ -176,8 +188,8 @@ export function createReader(deps: ReaderDeps): (req: Request) => Promise<Respon
     const range = req.headers.get('range');
 
     // 1) 本地优先：已下载的直接读盘，不碰网络、不需要 cookie
-    const local = localPath(deps, rec);
-    if (existsSync(local)) return serveLocal(local, method, range);
+    const local = findLocalPath(deps, rec);
+    if (local) return serveLocal(local, method, range);
 
     // 2) 在线直读：main 拿着 cookie 去 CDN 取流，renderer 只看到 fzpdf://
     if (!deps.hasCookie()) return json(401, { error: '在线阅读需要夸克 cookie' });

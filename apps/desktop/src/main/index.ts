@@ -1,18 +1,28 @@
 import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, renameSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { buildIndex, computeFacets, getBook, search, toLean } from '@fangzhi/core';
-import type { GazetteerIndex, RawShareDump, IndexMeta, LeanIndex } from '@fangzhi/core';
+import {
+  applyBookOverrides, buildIndex, computeFacets, countSearchableBooks,
+  emptyBookOverrides, getBook, overrideForBook, search, toLean,
+} from '@fangzhi/core';
+import type {
+  BookOverrideFields, BookOverrideFile, GazetteerIndex, RawShareDump, IndexMeta, LeanIndex,
+} from '@fangzhi/core';
 import { crawlShare, diffDumps, parseShareUrl } from '@fangzhi/core/crawl';
 import type { CrawlCheckpoint } from '@fangzhi/core/crawl';
-import { probeLogin } from '@fangzhi/core/download';
+import { clearSocialToken, probeLogin } from '@fangzhi/core/download';
 import type { SearchFilters } from '@fangzhi/core';
 import { CookieStore } from './cookies.ts';
 import { DownloadManager } from './download.ts';
 import type { DlItem } from './download.ts';
-import { localPath, registerReader, registerReaderSchemes } from './reader.ts';
+import { findLocalPath, registerReader, registerReaderSchemes } from './reader.ts';
 import type { ReaderDeps } from './reader.ts';
 import { createOcrReader } from './ocr.ts';
+
+// 自动化检查必须使用独立用户目录，避免碰真实 cookie、下载清单和校正记录。
+// 仅测试环境显式设置；正常启动不受影响。
+const testUserData = process.env.FZ_USER_DATA_DIR;
+if (testUserData) app.setPath('userData', resolve(testUserData));
 
 // fzpdf 必须在 app ready 之前声明为特权 scheme，否则 fetch / 流式响应都不可用。
 registerReaderSchemes();
@@ -28,7 +38,10 @@ let crawlAbort: AbortController | null = null;
  */
 function resolveDataDir(): string {
   const userDir = join(app.getPath('userData'), 'data');
-  const candidates = [userDir];
+  const candidates: string[] = [];
+  // 用户手动选择的数据目录优先，并在重启后继续使用。
+  if (settings.dataDir && existsSync(join(settings.dataDir, 'index.full.json'))) candidates.push(settings.dataDir);
+  candidates.push(userDir);
   if (app.isPackaged) candidates.push(join(process.resourcesPath, 'data'));
   let p = __dirname;
   for (let i = 0; i < 6; i++) {
@@ -43,9 +56,28 @@ function resolveDataDir(): string {
 let dataDir = '';
 let cookies: CookieStore;
 let downloads: DownloadManager;
-let settings: { downloadDir: string } = { downloadDir: '' };
+let bookOverrides: BookOverrideFile = emptyBookOverrides();
+let settings: { downloadDir: string; dataDir?: string } = { downloadDir: '' };
 
 function settingsPath(): string { return join(app.getPath('userData'), 'settings.json'); }
+function overridesPath(): string { return join(app.getPath('userData'), 'book-overrides.json'); }
+
+function loadBookOverrides(): BookOverrideFile {
+  try {
+    const raw = JSON.parse(readFileSync(overridesPath(), 'utf8')) as Partial<BookOverrideFile>;
+    if (raw?.version !== 1 || !raw.books || typeof raw.books !== 'object') return emptyBookOverrides();
+    return { version: 1, books: raw.books };
+  } catch {
+    return emptyBookOverrides();
+  }
+}
+
+function writeBookOverrides(): void {
+  const p = overridesPath();
+  const tmp = `${p}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(bookOverrides, null, 2) + '\n');
+  renameSync(tmp, p);
+}
 
 function loadSettings(): void {
   try {
@@ -58,10 +90,13 @@ function loadSettings(): void {
 
 function saveSettings(): void { writeFileSync(settingsPath(), JSON.stringify(settings, null, 2)); }
 
+/** 索引和断点都写同目录临时文件再替换；进程中断时不会留下半份 JSON。 */
 function writeJson(file: string, data: unknown): string {
   mkdirSync(dataDir, { recursive: true });
   const p = join(dataDir, file);
-  writeFileSync(p, typeof data === 'string' ? data : JSON.stringify(data));
+  const tmp = `${p}.${process.pid}.tmp`;
+  writeFileSync(tmp, typeof data === 'string' ? data : JSON.stringify(data));
+  renameSync(tmp, p);
   return p;
 }
 
@@ -74,6 +109,7 @@ function loadIndex(): { ok: boolean; error?: string } {
   }
   try {
     idx = JSON.parse(readFileSync(idxPath, 'utf8')) as GazetteerIndex;
+    applyBookOverrides(idx, bookOverrides);
     return { ok: true };
   } catch (e) {
     idx = null;
@@ -83,6 +119,23 @@ function loadIndex(): { ok: boolean; error?: string } {
 
 function send(channel: string, payload: unknown): void {
   win?.webContents.send(channel, payload);
+}
+
+/** 只允许打开夸克官方 HTTPS 页面；索引文件也可能来自外部目录，不能信任其中的 URL。 */
+function allowedExternal(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:' && (u.hostname === 'quark.cn' || u.hostname.endsWith('.quark.cn'));
+  } catch {
+    return false;
+  }
+}
+
+/** 文件操作只接受用户下载目录内的路径，不让渲染层借 shell 暴露任意位置。 */
+function insideDownloadDir(p: string): boolean {
+  const root = resolve(settings.downloadDir);
+  const target = resolve(p);
+  return target === root || target.startsWith(root + '\\') || target.startsWith(root + '/');
 }
 
 /** 阅读器的依赖注入：cookie / 目录 / 索引都延迟取值，whenReady 之后才真正可用。 */
@@ -103,16 +156,51 @@ function registerIpc(): void {
     hasIndex: !!idx,
     meta: idx?.meta,
     stats: idx?.stats,
+    searchableBookCount: idx ? countSearchableBooks(idx) : 0,
     crawledAt: idx?.crawledAt,
     version: app.getVersion(),
   }));
 
   ipcMain.handle('search', (_e, q: string, filters: SearchFilters, limit: number, offset: number) => {
-    if (!idx) return { total: 0, items: [], elapsedMs: 0, facets: { province: {}, era: {}, zhiType: {}, ext: {} } };
+    if (!idx) return { total: 0, directTotal: 0, available: 0, weakTotal: 0, weakShown: 0, items: [], elapsedMs: 0, facets: { province: {}, era: {}, zhiType: {}, ext: {} } };
     return search(idx, q, { ...filters, limit, offset });
   });
 
-  ipcMain.handle('book', (_e, id: string) => (idx ? getBook(idx, id) : undefined));
+  ipcMain.handle('book', (_e, id: string) => {
+    if (!idx) return undefined;
+    const d = getBook(idx, id);
+    return d ? { ...d, override: overrideForBook(bookOverrides, d.book) } : undefined;
+  });
+
+  ipcMain.handle('book-override-set', (_e, id: string, patch: BookOverrideFields) => {
+    if (!idx) return { ok: false, error: '没有索引' };
+    const book = idx.books.find((b) => b.id === id);
+    if (!book) return { ok: false, error: '找不到这本书' };
+    const allowed: Array<keyof BookOverrideFields> = [
+      'title', 'era', 'place', 'zhiType', 'province', 'author', 'edition',
+    ];
+    const clean: BookOverrideFields = {};
+    for (const key of allowed) {
+      if (key in patch) clean[key] = String(patch[key] ?? '').trim();
+    }
+    bookOverrides.books[id] = {
+      ...bookOverrides.books[id],
+      bookId: id,
+      fileIds: [...book.fileIds],
+      ...clean,
+      updatedAt: new Date().toISOString(),
+    };
+    try {
+      writeBookOverrides();
+      // 从磁盘重载基础索引后再合并全部校正，避免连续编辑时旧值叠加。
+      const fresh = JSON.parse(readFileSync(idxPath, 'utf8')) as GazetteerIndex;
+      applyBookOverrides(fresh, bookOverrides);
+      idx = fresh;
+      return { ok: true, applied: Object.keys(bookOverrides.books).length };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  });
 
   ipcMain.handle('facets', () => (idx ? computeFacets(idx) : { province: {}, era: {}, zhiType: {}, ext: {} }));
 
@@ -155,10 +243,12 @@ function registerIpc(): void {
       writeJson('meta.json', meta);
       if (existsSync(ckptPath)) rmSync(ckptPath);
 
-      // 爬完直接重建索引，用户不用再点一次
-      const next = buildIndex(dump, { meta: mergeMeta(meta) });
+      // 爬完直接重建索引，用户不用再点一次。把旧索引传进去以保留 OCR 关联。
+      const next = buildIndex(dump, { meta: mergeMeta(meta), previous: idx ?? undefined });
       idxPath = writeJson('index.full.json', next);
       writeJson('index.lean.json', toLean(next));
+      // 磁盘保留机器解析结果，用户校正只在本机运行时叠加。
+      applyBookOverrides(next, bookOverrides);
       idx = next;
 
       return { ok: true, diff, stats: next.stats, meta: next.meta };
@@ -172,9 +262,17 @@ function registerIpc(): void {
 
   ipcMain.handle('crawl-cancel', () => { crawlAbort?.abort(); return true; });
 
-  ipcMain.handle('open-external', (_e, url: string) => { shell.openExternal(url); return true; });
+  ipcMain.handle('open-external', (_e, url: string) => {
+    if (!allowedExternal(url)) return false;
+    void shell.openExternal(url);
+    return true;
+  });
 
-  ipcMain.handle('show-in-folder', (_e, p: string) => { shell.showItemInFolder(p); return true; });
+  ipcMain.handle('show-in-folder', (_e, p: string) => {
+    if (!insideDownloadDir(p)) return false;
+    shell.showItemInFolder(p);
+    return true;
+  });
 
   ipcMain.handle('pick-data-dir', async () => {
     const r = await dialog.showOpenDialog(win!, { properties: ['openDirectory'], title: '选择索引数据目录' });
@@ -184,6 +282,9 @@ function registerIpc(): void {
     dataDir = dir;
     idxPath = join(dir, 'index.full.json');
     idx = JSON.parse(readFileSync(idxPath, 'utf8')) as GazetteerIndex;
+    applyBookOverrides(idx, bookOverrides);
+    settings.dataDir = dir;
+    saveSettings();
     return { ok: true, dataDir, stats: idx.stats, meta: idx.meta, crawledAt: idx.crawledAt };
   });
 
@@ -191,17 +292,24 @@ function registerIpc(): void {
   ipcMain.handle('cookie-set', (_e, raw: string) => {
     try {
       cookies.set(raw);
+      clearSocialToken();
+      downloads.resumePending();
       return { ok: true, ...cookies.describe() };
     } catch (e) {
       return { ok: false, error: (e as Error).message };
     }
   });
-  ipcMain.handle('cookie-clear', () => { cookies.clear(); return cookies.describe(); });
+  ipcMain.handle('cookie-clear', () => {
+    cookies.clear();
+    clearSocialToken();
+    return cookies.describe();
+  });
   ipcMain.handle('cookie-test', () => (cookies.has() ? probeLogin(cookies.get()) : { ok: false, message: '还没配置 cookie' }));
 
   ipcMain.handle('dl-list', () => downloads.list());
   ipcMain.handle('dl-enqueue', (_e, items: DlItem[]) => { downloads.enqueue(items); return downloads.list(); });
   ipcMain.handle('dl-cancel', (_e, fid?: string) => { downloads.cancel(fid); return downloads.list(); });
+  ipcMain.handle('dl-retry', (_e, fid: string) => { downloads.retry(fid); return downloads.list(); });
   ipcMain.handle('dl-info', () => ({ dir: settings.downloadDir }));
 
   /** 这些 fid 里哪些已经在本地了。详情面板据此把「下载本书」换成「更新本书」。 */
@@ -210,7 +318,7 @@ function registerIpc(): void {
     const deps = readerDeps();
     const out: string[] = [];
     for (const rec of idx?.files ?? []) {
-      if (want.has(rec.fid) && existsSync(localPath(deps, rec))) out.push(rec.fid);
+      if (want.has(rec.fid) && findLocalPath(deps, rec)) out.push(rec.fid);
     }
     return out;
   });
@@ -229,8 +337,7 @@ function registerIpc(): void {
     if (rec.ext !== 'pdf') return { ok: false, error: `内置阅读器只支持 PDF，这是 .${rec.ext}` };
     if (rec.isArchivePart) return { ok: false, error: '这是分卷文件，请下载整组后阅读' };
     const url = `fzpdf://read?fid=${encodeURIComponent(fid)}`;
-    const local = localPath(readerDeps(), rec);
-    if (existsSync(local)) return { ok: true, mode: 'local', size: rec.size, url };
+    if (findLocalPath(readerDeps(), rec)) return { ok: true, mode: 'local', size: rec.size, url };
     if (!cookies.has()) return { ok: false, needCookie: true };
     return { ok: true, mode: 'online', size: rec.size, url };
   });
@@ -240,6 +347,22 @@ function registerIpc(): void {
   ipcMain.handle('ocr-page', (_e, fid: string, p: number, q?: string) => ocr.page(fid, p, q));
   ipcMain.handle('ocr-search', (_e, fid: string, q: string) => ocr.search(fid, q));
   ipcMain.handle('search-text', (_e, q: string) => ocr.searchAll(q));
+  ipcMain.handle('ocr-summary', () => {
+    const files = idx?.files ?? [];
+    return {
+      totalFiles: files.length,
+      textFiles: files.filter((f) => !!f.textRef).length,
+      doneFiles: files.filter((f) => f.ocrStatus === 'done').length,
+      doneBooks: idx?.books.filter((b) => b.ocrDone > 0).length ?? 0,
+      totalBooks: idx?.books.length ?? 0,
+    };
+  });
+  ipcMain.handle('open-ocr-folder', async () => {
+    const dir = join(dataDir, 'ocr');
+    mkdirSync(dir, { recursive: true });
+    const err = await shell.openPath(dir);
+    return err ? { ok: false, error: err } : { ok: true, dir };
+  });
 }
 
 /** 爬取拿到的 meta 缺 shareUrl 之外的字段时，沿用旧索引里的。 */
@@ -266,22 +389,25 @@ function createWindow(): void {
       preload: join(__dirname, '..', 'preload', 'index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
   });
 
   win.loadFile(resolve(__dirname, '..', 'renderer', 'index.html'));
 
   win.webContents.on('will-navigate', (e, url) => {
-    // 站内跳转之外一律丢给系统浏览器，避免窗口被外链顶掉
-    if (!url.startsWith('file://')) { e.preventDefault(); shell.openExternal(url); }
+    // 站内跳转之外一律拦截；只有夸克官方 HTTPS 地址才交给系统浏览器。
+    if (url.startsWith('file://')) return;
+    e.preventDefault();
+    if (allowedExternal(url)) void shell.openExternal(url);
   });
   win.on('closed', () => { win = null; });
 }
 
 app.whenReady().then(() => {
-  const r = loadIndex();
   loadSettings();
+  bookOverrides = loadBookOverrides();
+  const r = loadIndex();
   cookies = new CookieStore(app.getPath('userData'));
   downloads = new DownloadManager({
     cookie: () => cookies.get(),
@@ -289,6 +415,8 @@ app.whenReady().then(() => {
     destDir: () => settings.downloadDir,
     emit: (s) => send('dl-progress', s),
   });
+  downloads.restore();
+  if (cookies.has()) downloads.resumePending();
   registerIpc();
   registerReader(readerDeps());
   createWindow();

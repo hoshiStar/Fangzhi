@@ -77,9 +77,11 @@ Page({
     this.setData({
       books: append ? this.data.books.concat(rows) : rows,
       total: r.total,
-      hasMore: offset + rows.length < r.total,
+      hasMore: offset + rows.length < (r.available ?? r.total),
       loading: false,
-      summary: (q ? `命中 ${r.total} 部书 · ${r.elapsedMs}ms` : `共 ${r.total} 部书`)
+      summary: (q
+        ? `${r.directTotal > 0 ? '直接命中' : '部分/近似命中'} ${r.directTotal || r.total} 部书 · ${r.elapsedMs}ms`
+        : `共 ${r.total} 部书`)
         + (this.data.selProvinces.length || this.data.selEras.length ? ' · 已筛选' : ''),
     });
   },

@@ -17,14 +17,21 @@
       </div>
     </div>
     <div class="searchbox">
-      <input id="q" type="search" placeholder="搜书名、地名、志种、著者…（多词用空格隔开，全部命中才排前面）" autocomplete="off" spellcheck="false" />
+      <input id="q" type="search" placeholder="搜书名、地名、志种、著者…（空格分词，默认全词优先）" autocomplete="off" spellcheck="false" />
+      <label class="strict" title="勾选后只保留每个词都命中的结果"><input id="strict" type="checkbox" /> 全部词</label>
       <button id="clear" class="ghost" title="清空">✕</button>
     </div>
     <div class="topbtns">
-      <button id="btn-cookie" class="ghost">账号</button>
       <button id="btn-dl" class="ghost">下载<span id="dl-badge" class="badge hidden"></span></button>
-      <button id="btn-crawl" class="ghost">更新索引</button>
-      <button id="btn-dir" class="ghost">数据目录</button>
+      <details class="tools">
+        <summary>工具</summary>
+        <div class="toolmenu">
+          <button id="btn-cookie" class="ghost">账号与登录</button>
+          <button id="btn-ocr" class="ghost">全文识别</button>
+          <button id="btn-crawl" class="ghost">更新索引</button>
+          <button id="btn-dir" class="ghost">数据目录</button>
+        </div>
+      </details>
     </div>
   </header>
 
