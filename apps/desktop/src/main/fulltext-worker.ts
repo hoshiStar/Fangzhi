@@ -1,7 +1,7 @@
 import { parentPort } from 'node:worker_threads';
 import {
-  finalizeBooks, loadTextFast, mergeFileHit, normalizeText, resolveTextPath,
-  scanLoaded, textCachePath, textFileMtime,
+  cachedMask, finalizeBooks, loadTextFast, maskMayContain, mergeFileHit, normalizeText,
+  rememberMask, resolveTextPath, scanLoaded, textCachePath, textFileMtime,
 } from './fulltext-core.ts';
 import type { LoadedText, TextBookHit, TextFileTask } from './fulltext-core.ts';
 
@@ -11,10 +11,11 @@ import type { LoadedText, TextBookHit, TextFileTask } from './fulltext-core.ts';
  * 为什么要单开线程：一本志的 OCR 文本动辄几十万字，全库扫一遍要读上千个 jsonl、
  * 每页还要做一次繁简归一化了。放在主进程里同步跑，搜索框会整体卡住，连输入都掉帧。
  *
- * 两级缓存：
- * - 内存：按 (路径, mtime) 失效，上限 400 个文件——上千本全塞进来是几百兆，不划算；
- * - 磁盘：`data/.text-cache/*.txt`，只存原文和归一化文本，省掉 jsonl 里的坐标数组和
- *   opencc 换算，进程重启后第一次检索也是走缓存。
+ * 三级过滤：
+ * - 磁盘缓存头里的字符位图：查询字一个都没有的文件，正文一个字节都不读；
+ * - 磁盘缓存：`data/.text-cache/*.txt`，只存原文和归一化文本，省掉 jsonl 的坐标数组和
+ *   opencc 换算，进程重启后第一次检索也走缓存；
+ * - 内存：按 (路径, mtime) 失效，上限 400 个文件——上千本全塞进来是几百兆，不划算。
  */
 
 const MAX_CACHED_FILES = 400;
@@ -27,32 +28,69 @@ interface Job {
   files: TextFileTask[];
 }
 
+interface ScanStats {
+  cached: number;
+  parsed: number;
+  skipped: number;
+}
+
 const cache = new Map<string, { mtimeMs: number; loaded: LoadedText }>();
 const canceled = new Set<number>();
 const queue: Job[] = [];
 let running = false;
 
-function takeFromCache(file: string, cacheFile: string, stats: { cached: number; parsed: number }): LoadedText | null {
-  const mtimeMs = textFileMtime(file);
-  if (mtimeMs < 0) return null;
-  const hit = cache.get(file);
-  if (hit && hit.mtimeMs === mtimeMs) {
-    // 命中率靠 LRU 维持：重新插入把最近用到的推到队尾
-    cache.delete(file);
-    cache.set(file, hit);
-    return hit.loaded;
-  }
-  const r = loadTextFast(file, cacheFile);
-  if (!r) return null;
-  if (r.fromCache) stats.cached++;
-  else stats.parsed++;
+function remember(file: string, mtimeMs: number, loaded: LoadedText): void {
   cache.delete(file);
-  cache.set(file, { mtimeMs, loaded: r.loaded });
+  cache.set(file, { mtimeMs, loaded });
   while (cache.size > MAX_CACHED_FILES) {
     const oldest = cache.keys().next();
     if (oldest.done) break;
     cache.delete(oldest.value);
   }
+}
+
+function takeFromCache(
+  dataDir: string,
+  task: TextFileTask,
+  needle: string,
+  stats: ScanStats,
+): LoadedText | null {
+  const file = resolveTextPath(dataDir, task.textRef);
+  if (!file) return null;
+  const mtimeMs = textFileMtime(file);
+  if (mtimeMs < 0) return null;
+
+  const hit = cache.get(file);
+  if (hit && hit.mtimeMs === mtimeMs) {
+    // 命中率靠 LRU 维持：重新插入把最近用到的推到队尾
+    remember(file, mtimeMs, hit.loaded);
+    if (hit.loaded.mask && !maskMayContain(hit.loaded.mask, needle)) {
+      stats.skipped++;
+      return null;
+    }
+    return hit.loaded;
+  }
+
+  // 内存里没有：只读缓存头那几 KB，位图说不可能含就直接跳过
+  const cacheFile = textCachePath(dataDir, task.fid);
+  const head = cachedMask(file, cacheFile);
+  if (head && head.mtimeMs === mtimeMs && !maskMayContain(head.mask, needle)) {
+    stats.skipped++;
+    return null;
+  }
+
+  const r = loadTextFast(file, cacheFile, mtimeMs);
+  if (!r) return null;
+  remember(file, mtimeMs, r.loaded);
+  if (r.loaded.mask) {
+    rememberMask(file, mtimeMs, r.loaded.mask);
+    if (!maskMayContain(r.loaded.mask, needle)) {
+      stats.skipped++;
+      return null;
+    }
+  }
+  if (r.fromCache) stats.cached++;
+  else stats.parsed++;
   return r.loaded;
 }
 
@@ -71,8 +109,8 @@ async function runJob(job: Job): Promise<void> {
   const step = Math.max(1, Math.ceil(job.files.length / 40));
   // 每 8 个文件让出一次事件循环：取消消息才进得来，进度也不会几秒才跳一下
   const yieldEvery = 8;
-  // 这一轮有多少文件读的是磁盘缓存、多少重新解析过，供诊断脚本核对缓存是否生效
-  const stats = { cached: 0, parsed: 0 };
+  // 这一轮多少文件走了磁盘缓存、多少重新解析过、多少被位图直接排除，供诊断脚本核对
+  const stats: ScanStats = { cached: 0, parsed: 0, skipped: 0 };
   for (let i = 0; i < job.files.length; i++) {
     if (canceled.has(job.id)) {
       canceled.delete(job.id);
@@ -80,8 +118,7 @@ async function runJob(job: Job): Promise<void> {
       return;
     }
     const task = job.files[i]!;
-    const file = resolveTextPath(job.dataDir, task.textRef);
-    const loaded = file ? takeFromCache(file, textCachePath(job.dataDir, task.fid), stats) : null;
+    const loaded = takeFromCache(job.dataDir, task, needle, stats);
     if (loaded) {
       const { hits, count } = scanLoaded(loaded, needle);
       if (count) {

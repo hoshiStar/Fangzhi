@@ -1,4 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import {
+  closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync,
+} from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { Converter } from 'opencc-js';
 
@@ -64,6 +66,65 @@ export interface LoadedText {
   pages: Map<number, OcrPage>;
   /** 检索用：整页文本归一化成简体。aligned 表示和原文等长，下标可以直接互换。 */
   norm: Map<number, { n: string; aligned: boolean }>;
+  /** 出现过的字（见 textMask），用来在读整份正文之前先排除掉这个文件。 */
+  mask?: Uint8Array;
+}
+
+/* ---------- 字符位图：查询前的负向过滤 ---------- */
+
+/**
+ * 全库扫一遍时最大的浪费不是比对，而是「把根本不含查询字的文件也读进内存再比对」。
+ * 一部志的正文几百万字，但用到的汉字不过三四千个（占常用汉字的 20% 上下），
+ * 所以给每份文本配一张「出现过的字」位图：查询里任意一个字位图上没有，这个文件
+ * 一定不命中，连盘都不用读。
+ *
+ * 查询越长过滤越狠——六个字全都不在的概率是 0.2^6，全库基本只剩真正含这串字的文件。
+ */
+const CJK_START = 0x4e00;
+const CJK_END = 0x9fff;
+const CJK_SLOTS = CJK_END - CJK_START + 1;
+const ASCII_START = 0x20;
+const ASCII_END = 0x7e;
+const ASCII_SLOTS = ASCII_END - ASCII_START + 1;
+const MASK_BYTES = Math.ceil((CJK_SLOTS + ASCII_SLOTS) / 8);
+
+/** 字符落在位图里的下标；返回 -1 表示这个字不参与过滤（标点、扩展区生僻字）。 */
+function charSlot(cp: number): number {
+  if (cp >= CJK_START && cp <= CJK_END) return cp - CJK_START;
+  if (cp >= ASCII_START && cp <= ASCII_END) return CJK_SLOTS + cp - ASCII_START;
+  return -1;
+}
+
+export function textMask(text: string): Uint8Array {
+  const mask = new Uint8Array(MASK_BYTES);
+  for (const ch of text) {
+    const slot = charSlot(ch.codePointAt(0)!);
+    if (slot >= 0) mask[slot >> 3]! |= 1 << (slot & 7);
+  }
+  return mask;
+}
+
+function mergeMask(into: Uint8Array, add: Uint8Array): void {
+  for (let i = 0; i < into.length && i < add.length; i++) into[i]! |= add[i]!;
+}
+
+/** 位图说「不可能含」就一定不含；说「可能含」还要真扫一遍。 */
+export function maskMayContain(mask: Uint8Array, needle: string): boolean {
+  if (!mask.length) return true;
+  for (const ch of needle) {
+    const slot = charSlot(ch.codePointAt(0)!);
+    if (slot < 0) continue;
+    if (!(mask[slot >> 3]! & (1 << (slot & 7)))) return false;
+  }
+  return true;
+}
+
+/** 整份文本的位图：逐页归一化文本并起来，和检索时比对的是同一份字符。 */
+function maskOfLoaded(loaded: LoadedText): Uint8Array {
+  if (loaded.mask?.length === MASK_BYTES) return loaded.mask;
+  const mask = new Uint8Array(MASK_BYTES);
+  for (const { n } of loaded.norm.values()) mergeMask(mask, textMask(n));
+  return mask;
 }
 
 /** textRef 来自索引文件，按不可信输入处理：只允许落在数据目录内。 */
@@ -95,11 +156,13 @@ export function parseTextFile(content: string): LoadedText {
     }
   }
   const norm = new Map<number, { n: string; aligned: boolean }>();
+  const mask = new Uint8Array(MASK_BYTES);
   for (const [p, page] of pages) {
     const n = normalizeText(page.text);
     norm.set(p, { n, aligned: n.length === page.text.length });
+    mergeMask(mask, textMask(n));
   }
-  return { pages, norm };
+  return { pages, norm, mask };
 }
 
 export function loadTextFile(file: string): LoadedText {
@@ -116,9 +179,11 @@ export function loadTextFile(file: string): LoadedText {
  * 格式刻意不用 JSON：一行一页，字段用 \t 分隔，正文里的换行/制表符用控制字符占位，
  * 解析成本比 JSON.parse 一个带坐标数组的对象低一个量级。
  */
-const CACHE_MAGIC = 'FZTC1';
+const CACHE_MAGIC = 'FZTC2';
 const NL = '\u0001';
 const TAB = '\u0002';
+/** 缓存头（含 base64 位图约 3.5KB）一定在前面，读这么多足够。 */
+const HEADER_READ = 4096;
 
 function escapeCell(s: string): string {
   return s.replace(/\n/g, NL).replace(/\t/g, TAB);
@@ -133,7 +198,8 @@ export function textCachePath(dataDir: string, fid: string): string {
 }
 
 export function serializeTextCache(loaded: LoadedText, mtimeMs: number): string {
-  const rows: string[] = [`${CACHE_MAGIC}\t${mtimeMs}\t${loaded.pages.size}`];
+  const mask = Buffer.from(maskOfLoaded(loaded)).toString('base64');
+  const rows: string[] = [`${CACHE_MAGIC}\t${mtimeMs}\t${loaded.pages.size}\t${mask}`];
   for (const p of [...loaded.pages.keys()].sort((a, b) => a - b)) {
     const page = loaded.pages.get(p)!;
     const np = loaded.norm.get(p);
@@ -155,6 +221,7 @@ export function parseTextCache(content: string, mtimeMs: number): LoadedText | n
   const lines = content.split('\n');
   const head = lines[0]?.split('\t') ?? [];
   if (head[0] !== CACHE_MAGIC || Number(head[1]) !== mtimeMs) return null;
+  const mask = head[3] ? new Uint8Array(Buffer.from(head[3], 'base64')) : undefined;
 
   const pages = new Map<number, OcrPage>();
   const norm = new Map<number, { n: string; aligned: boolean }>();
@@ -172,15 +239,54 @@ export function parseTextCache(content: string, mtimeMs: number): LoadedText | n
     norm.set(p, { n, aligned });
   }
   if (!pages.size) return null;
-  return { pages, norm };
+  return { pages, norm, mask: mask?.length === MASK_BYTES ? mask : undefined };
+}
+
+/**
+ * 只读缓存文件开头那点字节，拿到 mtime 和字符位图。命中不了的文件因此可以
+ * 一个字节正文都不读——这是全库检索从「几秒」压到「几百毫秒」的关键。
+ */
+export function readCacheHeader(cacheFile: string): { mtimeMs: number; mask: Uint8Array } | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(cacheFile, 'r');
+    const buf = Buffer.allocUnsafe(HEADER_READ);
+    const n = readSync(fd, buf, 0, HEADER_READ, 0);
+    if (n <= 0) return null;
+    const text = buf.subarray(0, n).toString('utf8');
+    const nl = text.indexOf('\n');
+    // 缓存头没读完（理论上不会，位图是定长）就当无从判断
+    if (nl < 0) return null;
+    const cell = text.slice(0, nl).split('\t');
+    if (cell[0] !== CACHE_MAGIC) return null;
+    const mtimeMs = Number(cell[1]);
+    if (!Number.isFinite(mtimeMs)) return null;
+    const mask = new Uint8Array(Buffer.from(cell[3] ?? '', 'base64'));
+    if (mask.length !== MASK_BYTES) return null;
+    return { mtimeMs, mask };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // 忽略
+      }
+    }
+  }
 }
 
 /**
  * 取一份可直接检索的文本：优先读缓存，没缓存（或已过期）才解析 jsonl 并回写。
  * 写缓存是尽力而为——打包版的数据目录可能是只读的，失败不能影响检索。
  */
-export function loadTextFast(file: string, cacheFile: string): { loaded: LoadedText; fromCache: boolean } | null {
-  const mtimeMs = textFileMtime(file);
+export function loadTextFast(
+  file: string,
+  cacheFile: string,
+  knownMtime?: number,
+): { loaded: LoadedText; fromCache: boolean } | null {
+  const mtimeMs = knownMtime ?? textFileMtime(file);
   if (mtimeMs < 0) return null;
 
   try {
@@ -205,6 +311,73 @@ export function loadTextFast(file: string, cacheFile: string): { loaded: LoadedT
     // 只读目录或磁盘满：下次还是要重新解析，但不影响本次结果
   }
   return { loaded, fromCache: false };
+}
+
+/**
+ * 位图进程内缓存。全库上千个文件、每个 stat + open + read 三四个系统调用，
+ * 一次扫描光这些就要一两秒；位图才 2.6KB，全存下来 8MB，换来后续查询零 IO。
+ * 键是文件路径，值里带 mtime——OCR 重跑、缓存重建都会让 mtime 变，自然失效。
+ */
+const maskCache = new Map<string, { mtimeMs: number; mask: Uint8Array }>();
+const MAX_MASK_ENTRIES = 8000;
+
+/** 取某个文件的位图（进程内缓存优先，没有才读缓存头）。 */
+export function cachedMask(file: string, cacheFile: string): { mtimeMs: number; mask: Uint8Array } | null {
+  const hit = maskCache.get(file);
+  if (hit) {
+    maskCache.delete(file);
+    maskCache.set(file, hit);
+    return hit;
+  }
+  const head = readCacheHeader(cacheFile);
+  if (head) {
+    maskCache.set(file, head);
+    while (maskCache.size > MAX_MASK_ENTRIES) {
+      const oldest = maskCache.keys().next();
+      if (oldest.done) break;
+      maskCache.delete(oldest.value);
+    }
+  }
+  return head;
+}
+
+/** 已有位图（刚解析/刚加载出来）时直接登记，省掉一次读缓存头。 */
+export function rememberMask(file: string, mtimeMs: number, mask: Uint8Array): void {
+  if (!mask.length) return;
+  maskCache.delete(file);
+  maskCache.set(file, { mtimeMs, mask });
+  while (maskCache.size > MAX_MASK_ENTRIES) {
+    const oldest = maskCache.keys().next();
+    if (oldest.done) break;
+    maskCache.delete(oldest.value);
+  }
+}
+
+/** 测试用：清掉位图缓存，模拟换一个进程。 */
+export function clearMaskCache(): void {
+  maskCache.clear();
+}
+
+/**
+ * 检索前的取文本：先看缓存头的字符位图，明摆着不含查询字的文件直接跳过，
+ * 一个字节正文都不读；可能命中的才真正加载。
+ */
+export function loadForSearch(dataDir: string, task: TextFileTask, needle: string): LoadedText | null {
+  const file = resolveTextPath(dataDir, task.textRef);
+  if (!file) return null;
+  const mtimeMs = textFileMtime(file);
+  if (mtimeMs < 0) return null;
+  const cacheFile = textCachePath(dataDir, task.fid);
+  const head = cachedMask(file, cacheFile);
+  if (head && head.mtimeMs === mtimeMs && !maskMayContain(head.mask, needle)) return null;
+  const r = loadTextFast(file, cacheFile, mtimeMs);
+  // 缓存缺失或过期时刚重解析出来的位图更可信，再判一次
+  if (!r) return null;
+  if (r.loaded.mask) {
+    rememberMask(file, mtimeMs, r.loaded.mask);
+    if (!maskMayContain(r.loaded.mask, needle)) return null;
+  }
+  return r.loaded;
 }
 
 export function countIn(hay: string, needle: string): number {
@@ -292,15 +465,13 @@ export function scanAllSync(
   const books = new Map<string, TextBookHit>();
   let total = 0;
   for (const task of tasks) {
-    const file = resolveTextPath(dataDir, task.textRef);
-    if (!file) continue;
-    // 兜底路径同样吃磁盘缓存：至少别让界面在同步扫描时重复做 opencc
-    const r = loadTextFast(file, textCachePath(dataDir, task.fid));
-    if (!r) continue;
-    const { hits, count } = scanLoaded(r.loaded, needle);
+    // 位图先过一遍：命中不了的文件连缓存正文都不用读
+    const loaded = loadForSearch(dataDir, task, needle);
+    if (!loaded) continue;
+    const { hits, count } = scanLoaded(loaded, needle);
     if (!count) continue;
     total += count;
-    mergeFileHit(books, task, r.loaded, hits, count, needle);
+    mergeFileHit(books, task, loaded, hits, count, needle);
   }
   return { total, books: finalizeBooks(books, limit) };
 }

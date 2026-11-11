@@ -91,10 +91,33 @@ async function waitFor(expr, ms = 5000) {
   }
 }
 
+/** 等表达式的结果连续两次一致：冷启动时列表可能分两拍渲染。 */
+async function waitStable(expr, ms = 8000) {
+  const t0 = Date.now();
+  let last;
+  let same = 0;
+  for (;;) {
+    const v = await evaluate(ws, expr);
+    if (v === last) {
+      if (++same >= 2) return true;
+    } else {
+      same = 0;
+      last = v;
+    }
+    if (Date.now() - t0 > ms) return false;
+    await sleep(80);
+  }
+}
+
 /** 设置查询词并等列表真的刷新完。 */
 async function typeQuery(q, expectSummary) {
   await evaluate(ws, `(()=>{const el=document.getElementById('q');el.value=${JSON.stringify(q)};el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
-  await waitFor(expectSummary ? `/${expectSummary}/.test(document.getElementById('summary').textContent)` : 'true');
+  if (expectSummary) {
+    // 冷启动那一下检索链路长，给足时间；超时要喊出来，别带着旧列表继续断言
+    const ok = await waitFor(`/${expectSummary}/.test(document.getElementById('summary').textContent)`, 15000);
+    if (!ok) console.log(`WAIT  摘要「${expectSummary}」在 15s 内未出现`);
+  }
+  await waitStable(`document.querySelector('.book .t')?.textContent ?? ''`);
   await sleep(150);
 }
 
@@ -141,9 +164,10 @@ await check('清除筛选后恢复', `document.querySelectorAll('.book').length`
 
 // 详情面板：先确认列表已经切到检索结果，再点首条
 await typeQuery('保定府志', '保定府志');
+await waitFor(`document.querySelector('.book .t')?.textContent === '保定府志'`, 15000);
 await check('详情前列表已刷新', `document.querySelector('.book .t')?.textContent`, (v) => v === '保定府志');
 await evaluate(ws, `document.querySelector('.book').click()`);
-await waitFor(`/李振祜/.test(document.querySelector('.detail .meta')?.textContent ?? '')`);
+await waitFor(`/李振祜/.test(document.querySelector('.detail .meta')?.textContent ?? '')`, 15000);
 await check('详情面板打开', `!document.getElementById('detail').classList.contains('hidden')`, (v) => v === true);
 await check('详情标题', `document.querySelector('.detail h2')?.textContent`, (v) => v === '保定府志');
 await check('详情著录信息', `document.querySelector('.detail .meta')?.textContent`, (v) => /李振祜/.test(v) && /光绪刻本/.test(v));

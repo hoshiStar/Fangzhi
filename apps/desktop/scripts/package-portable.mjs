@@ -9,7 +9,10 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const desktop = dirname(here);
 const repo = resolve(desktop, '..', '..');
-const out = process.argv[2] ? resolve(process.argv[2]) : join(repo, 'release', 'portable-win-x64');
+// 先装配到临时目录，最后整体替换：本机上杀软/残留进程常会短暂锁住上一版
+// electron.exe 或 resources/*.asar，直接往旧目录里覆盖就会 EBUSY。
+const target = process.argv[2] ? resolve(process.argv[2]) : join(repo, 'release', 'portable-win-x64');
+const out = `${target}.staging-${process.pid}`;
 
 const src = join(repo, 'data', 'index.full.json');
 const pkg = JSON.parse(readFileSync(join(desktop, 'package.json'), 'utf8'));
@@ -95,10 +98,25 @@ writeFileSync(join(data, 'data-manifest.json'), JSON.stringify(manifest, null, 2
 
 renameSync(join(out, 'electron.exe'), join(out, '方志检索.exe'));
 
+// 替换旧产物。旧目录被占用时退让：留一份带时间戳的产物并明确告知，
+// 而不是把已经装配好的几百 MB 白扔。
+let finalOut = target;
+let replaced = true;
+try {
+  rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+  renameSync(out, target);
+} catch (e) {
+  replaced = false;
+  finalOut = `${target}-${new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)}`;
+  renameSync(out, finalOut);
+  console.warn(`注意：${target} 被占用，未能替换（${e.message.split('\n')[0]}）`);
+  console.warn(`      本次产物在 ${finalOut}；关掉占用它的程序后下次会正常覆盖。`);
+}
+
 const mb = (p) => (statSync(p).size / 1048576).toFixed(1);
-console.log(`便携版 -> ${out}`);
+console.log(`便携版 -> ${finalOut}${replaced ? '' : '（旧目录未能替换）'}`);
 console.log(`  version ${manifest.appVersion} · index ${manifest.index.sha256.slice(0, 12)}`);
-console.log(`  方志检索.exe  ${mb(join(out, '方志检索.exe'))} MB`);
-console.log(`  resources/app ${mb(join(app, 'dist', 'main', 'index.cjs'))} MB (main bundle)`);
-console.log(`  resources/data/index.full.json  ${mb(join(data, 'index.full.json'))} MB`);
+console.log(`  方志检索.exe  ${mb(join(finalOut, '方志检索.exe'))} MB`);
+console.log(`  resources/app ${mb(join(finalOut, 'resources', 'app', 'dist', 'main', 'index.cjs'))} MB (main bundle)`);
+console.log(`  resources/data/index.full.json  ${mb(join(finalOut, 'resources', 'data', 'index.full.json'))} MB`);
 console.log(`  OCR ${manifest.ocr.files} 文件 · 索引引用 ${manifest.index.ocrRefs} 个`);

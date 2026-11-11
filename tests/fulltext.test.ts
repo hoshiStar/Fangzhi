@@ -4,8 +4,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  finalizeBooks, loadTextFast, loadTextFile, mergeFileHit, parseTextCache, parseTextFile,
-  resolveTextPath, scanAllSync, scanLoaded, normalizeText, serializeTextCache, textCachePath,
+  finalizeBooks, loadForSearch, loadTextFast, loadTextFile, maskMayContain, mergeFileHit,
+  parseTextCache, parseTextFile, readCacheHeader, resolveTextPath, scanAllSync, scanLoaded,
+  normalizeText, serializeTextCache, textCachePath, textFileMtime, textMask,
 } from '../apps/desktop/src/main/fulltext-core.ts';
 import type { TextBookHit, TextFileTask } from '../apps/desktop/src/main/fulltext-core.ts';
 
@@ -185,4 +186,61 @@ test('缓存文件路径按 fid 收敛到安全文件名', () => {
   const p = textCachePath('D:/data', '../evil/../f-x1');
   assert.ok(!p.includes('..'), `不应出现上级路径：${p}`);
   assert.ok(p.includes('.text-cache'));
+});
+
+test('字符位图：查询里的字全在才放行，缺一个就排除', () => {
+  const mask = textMask(normalizeText('嘉慶贛州府志卷二　山川城池'));
+  assert.equal(maskMayContain(mask, normalizeText('赣州')), true);
+  assert.equal(maskMayContain(mask, normalizeText('赣州府志')), true);
+  // 「京」没出现过，含它的查询不必读这个文件
+  assert.equal(maskMayContain(mask, normalizeText('赣州京')), false);
+  // 不在位图范围内的字符（标点、扩展区生僻字）不参与过滤，不能误杀
+  assert.equal(maskMayContain(mask, normalizeText('赣州，')), true);
+  assert.equal(maskMayContain(mask, '𪚥'), true);
+  assert.equal(maskMayContain(new Uint8Array(0), normalizeText('赣州')), true);
+});
+
+test('缓存头能单独读出位图，旧格式缓存当作没有', () => {
+  const root = makeDataDir();
+  try {
+    const file = join(root, 'ocr', 'f-a1.jsonl');
+    const cacheFile = textCachePath(root, 'f-a1');
+    assert.ok(loadTextFast(file, cacheFile));
+
+    const head = readCacheHeader(cacheFile);
+    assert.ok(head, '新写的缓存应当能读出头部');
+    assert.equal(head.mtimeMs, textFileMtime(file));
+    assert.equal(maskMayContain(head.mask, normalizeText('赣州')), true);
+    assert.equal(maskMayContain(head.mask, normalizeText('京')), false);
+
+    // FZTC1 时代没有位图字段，宁可当没有缓存重新解析，也不要误判成「都不含」
+    writeFileSync(cacheFile, `FZTC1\t${textFileMtime(file)}\t1\n1\t1\t贛州府志\n`);
+    assert.equal(readCacheHeader(cacheFile), null);
+    const again = loadTextFast(file, cacheFile);
+    assert.equal(again?.fromCache, false, '旧格式应重新解析并升级');
+    assert.equal(again?.loaded.pages.get(2)?.text, '贛州府志卷二　山川　贛江在其北');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('位图预筛：不含查询字的文件直接跳过，含的照常返回', () => {
+  const root = makeDataDir();
+  try {
+    writeFileSync(join(root, 'ocr', 'f-n1.jsonl'), [
+      page(1, '順天府志　京師形勝'),
+    ].join('\n'));
+    const north: TextFileTask = {
+      fid: 'f-n1', bookId: 'book-n', title: '順天府志', name: 'n1.pdf', textRef: 'ocr/f-n1.jsonl',
+    };
+
+    // 没缓存也照样能用：解析一次顺手写出缓存，然后按位图判定
+    assert.ok(loadForSearch(root, north, normalizeText('赣州')) === null, '不含「赣州」的文件应被排除');
+    assert.ok(loadForSearch(root, north, normalizeText('京师')), '含「京师」的文件应正常返回');
+    assert.ok(loadForSearch(root, tasks[0]!, normalizeText('赣州')), '含查询字的文件不能被误杀');
+    // 排除与否不影响整体结果
+    assert.equal(scanAllSync([...tasks, north], root, '赣州', 20).total, 6);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
