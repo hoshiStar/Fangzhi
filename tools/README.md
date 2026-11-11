@@ -6,6 +6,7 @@
 
 - `verify-search.ts`：检索样例、筛选和性能诊断，不改写数据。
 - `tools/cdp-detail.mjs`：通过 CDP 观察详情页异步时序，不包含写操作。
+- `tools/check-fulltext-worker.mjs`：在临时目录造 OCR 样本，直接驱动 `dist/main/fulltext-worker.cjs`，验证命中的页码聚合、扫描进度、取消和空查询。只写系统临时目录，需要先 `npm run build:desktop`。
 
 ## 会改写本地数据
 

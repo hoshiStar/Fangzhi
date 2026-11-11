@@ -70,7 +70,8 @@ ws.addEventListener('message', (ev) => {
 const checks = [];
 async function check(name, expr, assert) {
   try {
-    const v = await evaluate(ws, expr);
+    // 允许直接传 JS 布尔值（waitFor 的返回值），不必再拼一条表达式
+    const v = typeof expr === 'string' ? await evaluate(ws, expr) : expr;
     const ok = assert(v);
     checks.push({ name, ok, v });
     console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}  →  ${JSON.stringify(v)?.slice(0, 220)}`);
@@ -254,6 +255,18 @@ await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
 await evaluate(ws, `(async () => { document.getElementById('btn-crawl').click(); await new Promise(r => setTimeout(r, 300)); })()`);
 await check('爬取弹层出现', `!document.getElementById('crawlbar').classList.contains('hidden') && !!document.getElementById('c-url')`, (v) => v === true);
 await check('爬取链接预填', `document.getElementById('c-url').value`, (v) => v === 'https://pan.quark.cn/s/2d5c2ddfe25b');
+await evaluate(ws, `document.getElementById('c-close')?.click()`);
+
+// 全库全文检索：查一个只出现在 OCR 正文、不在书名里的词，验证 worker 线程链路真的通了
+await typeQuery('成文出版社', '成文出版社');
+const textHit = await waitFor(`/全文命中|全文没有命中/.test(document.getElementById('textlist').textContent)`, 25000);
+await check('全文检索返回结果块', textHit, (v) => v === true);
+await check('全文命中计数', `document.getElementById('textlist').textContent`, (v) => /全文命中\s*\d+\s*处/.test(v));
+await check('全文命中行可跳页', `document.querySelectorAll('#textlist .thit').length`, (v) => v >= 1);
+// worker 起不来会退回主进程同步扫描，界面会卡；这条保证没走兜底
+await check('全文检索未退化为同步模式', `document.getElementById('textlist').textContent`, (v) => !/兼容模式/.test(v));
+await typeQuery('', '浏览全部');
+await waitFor(`document.querySelectorAll('.book').length === 50`, 15000);
 
 // 下载与账号：会写/清 cookie，默认不在真实用户目录执行
 if (allowCookieMutation) {

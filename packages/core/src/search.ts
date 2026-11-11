@@ -134,6 +134,17 @@ export function normalizeForSearch(s: string | undefined): string {
 }
 
 /**
+ * 比较用的紧凑串：去掉标点、括号、空白和卷次分隔符。
+ * 书名常写成「（嘉慶）贛州府志」，用户却习惯连写成「嘉慶贛州府志」，
+ * 不抹平这些符号，整串子串匹配就一定落空，只能掉到「近似 100%」里。
+ */
+const COMPACT_DROP = /[\s\u3000（）()［］\[\]【】《》〈〉「」『』·・,，.。、;；:：!！?？'"“”‘’\-—_/\\|#*]/g;
+
+export function compactForSearch(s: string | undefined): string {
+  return s ? s.replace(COMPACT_DROP, '') : '';
+}
+
+/**
  * 模糊命中判定用的字集。只看汉字，英文数字交给精确子串匹配。
  * 单独抽出来是为了在几千部书上复用时不必反复构造。
  */
@@ -214,20 +225,29 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
     const disp = normalizeForSearch(b.displayTitle);
     const author = normalizeForSearch(b.author);
     const edition = normalizeForSearch(b.edition);
+    // 紧凑串只给书名和完整名用：地名、作者跟着去标点没有意义，还会放大误命中
+    const cTitle = compactForSearch(title);
+    const cDisp = compactForSearch(disp);
 
     if (q) {
       // 单个词在某个字段上的得分。多词查询对每个词各算一次。
       // place 在没解析出志种时会退化成书名本身，这时它是冗余信息，不再计分——
       // 否则"保定府志序列目录"会因为书名和地名双重命中而压过真正的《保定府志》。
       const placeField = place && place !== title ? place : '';
-      const fieldScore = (t: string): { s: number; tags: string[] } => {
+      const fieldScore = (t: string, ct: string): { s: number; tags: string[] } => {
         let s = 0;
         const tags: string[] = [];
         if (title === t) { s += 1000; tags.push('书名精确'); }
         else if (title.startsWith(t)) { s += 400; tags.push('书名开头'); }
         else if (title.includes(t)) { s += 200; tags.push('书名包含'); }
+        else if (ct && cTitle === ct) { s += 380; tags.push('书名紧凑'); }
+        else if (ct.length >= 2 && cTitle.includes(ct)) { s += 180; tags.push('书名包含'); }
+        // 反向包含：用户把朝代、丛书名和书名连着打进查询（「嘉慶贛州府志」「中国地方志集成江西…吉水县志」），
+        // 整串当然不会等于书名，但书名完整地出现在查询里，意图已经非常明确。
+        else if (title.length >= 3 && t.includes(title)) { s += 700; tags.push('书名被包含'); }
         if (placeField.includes(t)) { s += 120; tags.push('地名'); }
         if (disp.includes(t) && !tags.length) { s += 90; tags.push('完整名'); }
+        else if (ct.length >= 2 && cDisp.includes(ct) && !tags.length) { s += 90; tags.push('完整名'); }
         if (era && era.includes(t)) { s += 60; tags.push('朝代'); }
         if (zhi && zhi.includes(t)) { s += 40; tags.push('志种'); }
         if (author.includes(t)) { s += 50; tags.push('作者'); }
@@ -241,7 +261,9 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
         const vol = normalizeForSearch(fl.volume);
         return nm.includes(t) || (!!sec && sec.includes(t)) || (!!vol && vol.includes(t));
       });
-      const termRows = terms.map((t) => ({ t, field: fieldScore(t), inFile: fileHas(t) }));
+      const termRows = terms.map((t) => ({
+        t, field: fieldScore(t, compactForSearch(t)), inFile: fileHas(t),
+      }));
       const anyField = termRows.some((r) => r.field.s > 0);
       const anyFile = termRows.some((r) => r.inFile);
       const fieldSum = termRows.reduce((n, r) => n + r.field.s, 0);
@@ -265,11 +287,21 @@ export function search(idx: AnyIndex, query: string, opts: SearchOptions = {}): 
         }
       } else {
         const covered = termRows.filter((r) => r.field.s > 0 || r.inFile).length;
+        // 书名整体对上（精确/开头/被包含）时，多打的朝代、丛书名不该把结果降级成「部分命中」：
+        // 「嘉慶 贛州府志」里「嘉慶」在索引里根本没有对应字段，但用户要找的就是《赣州府志》。
+        const titleStrong = termRows.some((r) => r.field.tags.some(
+          (tg) => tg === '书名精确' || tg === '书名开头' || tg === '书名被包含',
+        ));
         if (covered === terms.length) {
           score += fieldSum;
           direct = true;
           match = anyField ? 'field' : 'file';
           if (!anyField) matched.push('文件信息');
+        } else if (titleStrong && !opts.allTermsOnly && covered > 0) {
+          score += fieldSum;
+          direct = true;
+          match = 'field';
+          matched.push(`书名命中，${terms.length - covered} 词未对上`);
         } else if (covered > 0 && !opts.allTermsOnly) {
           score += Math.round(fieldSum * 0.3);
           match = 'partial';

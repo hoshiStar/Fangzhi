@@ -105,6 +105,7 @@ uv run tools/ocr/ocr.py --dir "下载目录" --fids <fid1>,<fid2>   # 只识别�
 - `verify-index.ts`：会覆盖索引，必须显式加 `--write`。
 - `verify-crawl-resume.ts`：会真实联网爬取，必须显式加 `--run`。
 - `tools/cdp-probe.mjs`：默认只读界面检查；账号/下载写操作需要显式环境变量和隔离 profile。
+- `tools/check-fulltext-worker.mjs`：用临时数据目录直接起全文检索 worker，验证聚合、进度与取消；需要先 `npm run build:desktop`。
 - 使用隔离 profile 启动桌面端：
 
 ```bash
@@ -124,8 +125,8 @@ FZ_USER_DATA_DIR=.tmp/cdp-profile npx electron apps/desktop --remote-debugging-p
 
 ## 当前已知限制
 
-- 全库全文检索仍在主进程同步扫描，OCR 覆盖上千本后会明显变慢，需要迁到 worker 或倒排索引。
+- 全库全文检索已迁到独立 worker 线程，界面不再被上千个 JSONL 的解析卡住；但首次检索仍需逐本读盘（数秒级），线程内只缓存最近 400 个文件。OCR 覆盖上千本后要做成倍提速，需要进一步落持久化倒排索引。
 - 识别模型首次使用需联网下载（约 100 MB），应用内还没有下载进度提示。
-- 繁体查询按整体子串匹配，没有分词；「嘉慶贛州府志」这类连写建议用空格分隔（「嘉慶 贛州府志」）。
+- 查询没有做分词：连写（「嘉慶贛州府志」）靠去标点的紧凑串和「书名被查询包含」反向命中，中间夹错字时仍只会落到「近似」一档。
 - 小程序仍需真实 AppID、真机验收和发布流程。
 - 人工校正以当前书目成员文件校验身份；解析规则大幅变化导致书目重新聚合时，校正可能被安全忽略，需要重新确认。

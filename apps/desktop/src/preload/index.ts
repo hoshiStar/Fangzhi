@@ -32,6 +32,11 @@ const api = {
   ocrPage: (fid: string, p: number, q?: string) => ipcRenderer.invoke('ocr-page', fid, p, q),
   ocrSearch: (fid: string, q: string) => ipcRenderer.invoke('ocr-search', fid, q),
   searchText: (q: string) => ipcRenderer.invoke('search-text', q),
+  onTextProgress: (cb: (p: unknown) => void) => {
+    const h = (_e: unknown, p: unknown) => cb(p);
+    ipcRenderer.on('search-text-progress', h);
+    return () => ipcRenderer.removeListener('search-text-progress', h);
+  },
   ocrSummary: () => ipcRenderer.invoke('ocr-summary'),
   openOcrFolder: () => ipcRenderer.invoke('open-ocr-folder'),
   ocrRunnerStatus: () => ipcRenderer.invoke('ocr-runner-status'),

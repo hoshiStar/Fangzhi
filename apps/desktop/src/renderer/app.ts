@@ -37,7 +37,10 @@ declare global {
       searchText(q: string): Promise<{
         total: number;
         books: Array<{ bookId: string; title: string; count: number; files: Array<{ fid: string; name: string; count: number; pages: Array<{ p: number; n: number }>; snippet: string; marks: Array<[number, number]> }> }>;
+        canceled?: boolean;
+        degraded?: boolean;
       }>;
+      onTextProgress(cb: (p: { scanned: number; total: number; q: string }) => void): () => void;
       ocrSummary(): Promise<{ totalFiles: number; textFiles: number; doneFiles: number; doneBooks: number; totalBooks: number }>;
       openOcrFolder(): Promise<{ ok: boolean; dir?: string; error?: string }>;
       ocrRunnerStatus(): Promise<{ job: OcrJobState; runtime: { runtime: string; label: string; note: string } }>;
@@ -352,6 +355,8 @@ async function run(): Promise<void> {
 }
 
 let textRunSeq = 0;
+/** 主进程 worker 推来的扫描进度，用于「检索中」占位文案。 */
+let textProgress: { scanned: number; total: number; q: string } | null = null;
 
 /** 全库全文命中：单独一块展示，避免正文命中被书名结果淹掉。 */
 async function renderTextHits(q: string, mine: number): Promise<void> {
@@ -362,8 +367,21 @@ async function renderTextHits(q: string, mine: number): Promise<void> {
     box.innerHTML = '';
     return;
   }
+  // 先占位：全库扫描要读上千个 jsonl，不能一直挂着上一次的命中列表
+  box.innerHTML = `<div class="thead">全文检索中…</div><div class="thint" id="tprog">正在读取本机 OCR 文本</div>`;
+  box.classList.remove('hidden');
+  const tick = setInterval(() => {
+    const el = box.querySelector('#tprog');
+    if (!el) { clearInterval(tick); return; }
+    if (textProgress && textProgress.q === q.trim() && textProgress.total) {
+      el.textContent = `已扫描 ${textProgress.scanned}/${textProgress.total} 个文件 · 首次较慢，之后走缓存`;
+    }
+  }, 200);
+
   const r = await window.fz.searchText(q);
+  clearInterval(tick);
   if (token !== textRunSeq || mine !== runSeq) return;
+  if (r.canceled) return;
   if (!r.books.length) {
     const coverage = state.ocrTextFiles
       ? `当前全文库覆盖 ${state.ocrTextFiles}/${state.ocrTotalFiles} 个文件，未命中不代表原书没有该内容。`
@@ -372,8 +390,10 @@ async function renderTextHits(q: string, mine: number): Promise<void> {
     box.classList.remove('hidden');
     return;
   }
+  const slow = r.degraded ? '<div class="thint">检索线程不可用，本次走兼容模式（主进程同步扫描）。</div>' : '';
   box.innerHTML = `
     <div class="thead">全文命中 ${r.total} 处 · ${r.books.length} 部书</div>
+    ${slow}
     ${r.books.map((b) => `
       <div class="tbook">
         <div class="tb-title">${esc(b.title)}<span class="tag">${b.count} 处</span></div>
@@ -1287,6 +1307,8 @@ window.fz.onDlProgress((s) => {
   dl.set(s.fid, s);
   renderDl();
 });
+
+window.fz.onTextProgress((p) => { textProgress = p; });
 
 window.fz.onOcrProgress(renderOcrJob);
 window.fz.onOcrDone((r) => {

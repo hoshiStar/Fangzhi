@@ -1,7 +1,12 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
 import type { GazetteerIndex } from '@fangzhi/core';
-import { Converter } from 'opencc-js';
+import {
+  finalizeBooks, mergeFileHit, normalizeText, scanLoaded,
+} from './fulltext-core.ts';
+import type { LoadedText, OcrPage, TextBookHit } from './fulltext-core.ts';
+
+export type { OcrLine, OcrPage, TextBookHit } from './fulltext-core.ts';
 
 export interface OcrDeps {
   index(): GazetteerIndex | null;
@@ -9,63 +14,31 @@ export interface OcrDeps {
   dataDir(): string;
 }
 
-export interface OcrLine {
-  t: string;
-  /** [x0, y0, x1, y1]，基于该页按 dpi 渲染后的像素。 */
-  b: number[];
-  s: number;
-}
-
-export interface OcrPage {
-  p: number;
-  dpi: number;
-  w: number;
-  h: number;
-  dir?: 'v' | 'h';
-  text: string;
-  lines: OcrLine[];
-}
-
-/** 全库全文命中的一部书。 */
-export interface TextBookHit {
-  bookId: string;
-  title: string;
-  count: number;
-  files: Array<{
-    fid: string;
-    name: string;
-    count: number;
-    pages: Array<{ p: number; n: number }>;
-    snippet: string;
-    /** snippet 里的命中区间，供渲染层高亮（繁简已对齐）。 */
-    marks: Array<[number, number]>;
-  }>;
-}
-
-interface Loaded {
-  pages: Map<number, OcrPage>;
-  /** 检索用：整页文本归一化成简体，避免简体查询搜不到繁体 OCR 文本。 */
-  norm: Map<number, { n: string; aligned: boolean }>;
-}
-
-const t2s = Converter({ from: 'tw', to: 'cn' });
-const norm = (s: string): string => t2s(s);
+const norm = normalizeText;
 
 /**
  * 读 OCR 产物（data/ocr/<fid>.jsonl，见 tools/ocr/ocr.py）。
  * 阅读器只按页取，不整本塞进渲染进程；文件在 OCR 重跑后会变，用 mtime 失效缓存。
+ *
+ * 全库检索走 fulltext.ts 的 worker，这里的 searchAll 只是 worker 不可用时的兜底，
+ * 两条路径共用 fulltext-core 里的解析与聚合，避免各写一套。
  */
 export function createOcrReader(deps: OcrDeps) {
-  const cache = new Map<string, { mtimeMs: number; loaded: Loaded }>();
+  const cache = new Map<string, { mtimeMs: number; loaded: LoadedText }>();
 
-  function load(fid: string): Loaded | null {
+  function locate(fid: string): string | null {
     const rec = deps.index()?.files.find((f) => f.fid === fid);
     if (!rec?.textRef) return null;
     const root = resolve(deps.dataDir());
     const file = resolve(root, rec.textRef);
     // textRef 来自索引文件，仍按不可信输入处理：只允许落在数据目录内
     if (!file.startsWith(root + sep) || !existsSync(file)) return null;
+    return file;
+  }
 
+  function load(fid: string): LoadedText | null {
+    const file = locate(fid);
+    if (!file) return null;
     const mtimeMs = statSync(file).mtimeMs;
     const hit = cache.get(file);
     if (hit && hit.mtimeMs === mtimeMs) return hit.loaded;
@@ -89,12 +62,6 @@ export function createOcrReader(deps: OcrDeps) {
     const loaded = { pages, norm: normMap };
     cache.set(file, { mtimeMs, loaded });
     return loaded;
-  }
-
-  function countIn(hay: string, needle: string): number {
-    let n = 0;
-    for (let at = hay.indexOf(needle); at !== -1; at = hay.indexOf(needle, at + needle.length)) n++;
-    return n;
   }
 
   return {
@@ -127,67 +94,37 @@ export function createOcrReader(deps: OcrDeps) {
       const loaded = load(fid);
       const needle = norm(q.trim());
       if (!loaded || !needle) return { hits: [] as Array<{ p: number; n: number }>, total: 0 };
-      const hits: Array<{ p: number; n: number }> = [];
-      let total = 0;
-      for (const p of [...loaded.pages.keys()].sort((a, b) => a - b)) {
-        const n = countIn(loaded.norm.get(p)?.n ?? '', needle);
-        if (n) {
-          hits.push({ p, n });
-          total += n;
-        }
-      }
-      return { hits, total };
+      const { hits, count } = scanLoaded(loaded, needle);
+      return { hits, total: count };
     },
 
-    /** 全库全文检索：按书聚合，每本只带前几个命中页和一句片段，按命中次数排序。 */
+    /** 全库全文检索（同步兜底版）：按书聚合，每本只带前几个命中页和一句片段。 */
     searchAll(q: string, limit = 20) {
       const idx = deps.index();
       const needle = norm(q.trim());
       if (!idx || !needle) return { total: 0, books: [] as TextBookHit[] };
 
-      const titles = new Map(idx.books.map((b) => [b.id, b.title]));
       const books = new Map<string, TextBookHit>();
+      const titles = new Map(idx.books.map((b) => [b.id, b.title] as const));
       let total = 0;
 
       for (const rec of idx.files) {
         if (!rec.textRef) continue;
         const loaded = load(rec.fid);
         if (!loaded) continue;
-        const hits: Array<{ p: number; n: number }> = [];
-        for (const p of [...loaded.pages.keys()].sort((a, b) => a - b)) {
-          const n = countIn(loaded.norm.get(p)?.n ?? '', needle);
-          if (n) hits.push({ p, n });
-        }
-        if (!hits.length) continue;
-        const count = hits.reduce((s, h) => s + h.n, 0);
+        const { hits, count } = scanLoaded(loaded, needle);
+        if (!count) continue;
         total += count;
-
-        const first = loaded.pages.get(hits[0]!.p)!;
-        const np = loaded.norm.get(hits[0]!.p)!;
-        const at = np.n.indexOf(needle);
-        // aligned 时原始文本和归一化文本等长，下标可以直接用；片段里 \n 换成空格也保持等长
-        const src = at >= 0 && np.aligned ? first.text : np.n;
-        const from = Math.max(0, at - 24);
-        const to = Math.max(from, at) + needle.length + 40;
-        const snippet = src.slice(from, to).replace(/\n/g, ' ');
-        const marks: Array<[number, number]> = at >= 0 && np.aligned
-          ? [[at - from, at - from + needle.length]]
-          : [];
-
-        const hit: TextBookHit = books.get(rec.bookId) ?? {
+        mergeFileHit(books, {
+          fid: rec.fid,
           bookId: rec.bookId,
           title: titles.get(rec.bookId) ?? rec.bookId,
-          count: 0,
-          files: [],
-        };
-        hit.count += count;
-        hit.files.push({ fid: rec.fid, name: rec.name, count, pages: hits.slice(0, 3), snippet, marks });
-        books.set(rec.bookId, hit);
+          name: rec.name,
+          textRef: rec.textRef,
+        }, loaded, hits, count, needle);
       }
 
-      const sorted = [...books.values()].sort((a, b) => b.count - a.count);
-      for (const b of sorted) b.files.sort((x, y) => y.count - x.count);
-      return { total, books: sorted.slice(0, limit) };
+      return { total, books: finalizeBooks(books, limit) };
     },
   };
 }

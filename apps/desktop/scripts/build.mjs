@@ -32,6 +32,17 @@ await build({
   target: 'node22',
 });
 
+// 全库全文检索的 worker 线程：作为独立文件随主进程一起发（main/fulltext.ts 按路径起线程）。
+// 必须和主进程同目录，打包脚本整目录拷 dist，不用单独处理。
+await build({
+  ...shared,
+  entryPoints: ['src/main/fulltext-worker.ts'],
+  outfile: 'dist/main/fulltext-worker.cjs',
+  platform: 'node',
+  format: 'cjs',
+  target: 'node22',
+});
+
 await build({
   entryPoints: ['src/renderer/app.ts'],
   outfile: 'dist/renderer/app.js',

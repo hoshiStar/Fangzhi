@@ -18,6 +18,8 @@ import type { DlItem } from './download.ts';
 import { findLocalPath, registerReader, registerReaderSchemes } from './reader.ts';
 import type { ReaderDeps } from './reader.ts';
 import { createOcrReader } from './ocr.ts';
+import { createFulltextSearch } from './fulltext.ts';
+import type { TextFileTask } from './fulltext-core.ts';
 import { createOcrRunner } from './ocr-runner.ts';
 import { createLibrary } from './library.ts';
 
@@ -153,6 +155,32 @@ const readerDeps = (): ReaderDeps => ({
 
 /** OCR 文本读取，延迟取值同上。 */
 const ocr = createOcrReader({ index: () => idx, dataDir: () => dataDir });
+
+/**
+ * 全库全文检索跑在 worker 线程里。传给线程的只有 fid / 书名 / textRef，
+ * 不带整份索引；界面不会被上千个 jsonl 的解析和繁简归一化卡住。
+ */
+const fulltext = createFulltextSearch({
+  tasks: (): TextFileTask[] => {
+    const i = idx;
+    if (!i) return [];
+    const titles = new Map(i.books.map((b) => [b.id, b.title] as const));
+    const out: TextFileTask[] = [];
+    for (const f of i.files) {
+      if (!f.textRef) continue;
+      out.push({
+        fid: f.fid,
+        bookId: f.bookId,
+        title: titles.get(f.bookId) ?? f.bookId,
+        name: f.name,
+        textRef: f.textRef,
+      });
+    }
+    return out;
+  },
+  dataDir: () => dataDir,
+  onProgress: (p) => send('search-text-progress', p),
+});
 
 /**
  * 识别脚本位置。开发版在仓库里；打包版随 resources 一起发（见 package-portable.mjs）。
@@ -378,7 +406,8 @@ function registerIpc(): void {
   ipcMain.handle('ocr-info', (_e, fid: string) => ocr.info(fid));
   ipcMain.handle('ocr-page', (_e, fid: string, p: number, q?: string) => ocr.page(fid, p, q));
   ipcMain.handle('ocr-search', (_e, fid: string, q: string) => ocr.search(fid, q));
-  ipcMain.handle('search-text', (_e, q: string) => ocr.searchAll(q));
+  // 全库全文检索走独立线程；同一时间只跑一条，新查询顶掉旧查询。
+  ipcMain.handle('search-text', (_e, q: string) => fulltext.search(q));
   ipcMain.handle('ocr-summary', () => {
     const files = idx?.files ?? [];
     return {
@@ -480,6 +509,8 @@ app.whenReady().then(() => {
   if (!r.ok) dialog.showErrorBox('索引未就绪', r.error ?? '');
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+  // worker 线程不会自己退出，退出前显式收掉，避免残留进程
+  app.on('before-quit', () => fulltext.dispose());
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

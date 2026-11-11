@@ -143,3 +143,52 @@ test('桌面 full 与小程序 mini 的关键查询一致', { skip: !existsSync(
     assert.equal(a.items[0]?.book.id, b.items[0]?.book.id, `first result mismatch: ${q}`);
   }
 });
+
+/** 书名里带朝代括注的书：解析会把「（嘉慶）」拆进完整名，title 本身不含括号。 */
+function punctFixture(): RawShareDump {
+  return {
+    rows: [
+      { type: 'dir', path: '/测试/各地方志', name: '各地方志', size: 0, fid: 'dir-root', depth: 1 },
+      { type: 'dir', path: '/测试/各地方志/江西/赣州', name: '赣州', size: 0, fid: 'dir-gz', depth: 3 },
+      {
+        type: 'file',
+        path: '/测试/各地方志/江西/赣州/（嘉慶）贛州府志.pdf',
+        name: '（嘉慶）贛州府志.pdf',
+        size: 100,
+        fid: 'f-gz',
+        depth: 4,
+        pdir_fid: 'dir-gz',
+      },
+      {
+        type: 'file',
+        path: '/测试/各地方志/江西/赣州/赣州府志.pdf',
+        name: '赣州府志.pdf',
+        size: 100,
+        fid: 'f-gz2',
+        depth: 4,
+        pdir_fid: 'dir-gz',
+      },
+    ],
+    stat: { reqCount: 1, maxDepth: 4 },
+  };
+}
+
+test('连写繁体查询靠紧凑串直接命中，不再掉进「近似」', () => {
+  const idx = buildIndex(punctFixture(), { meta: META });
+  const target = idx.books.find((b) => /贛州府志|赣州府志/.test(b.title) && b.displayTitle?.includes('嘉慶'));
+  assert.ok(target, '夹具应解析出带朝代括注的书');
+
+  // 「嘉慶贛州府志」中间不加空格，整串子串匹配会失败，去标点后才能对上完整名
+  const joined = search(idx, '嘉慶贛州府志', { limit: 5 });
+  const hit = joined.items.find((h) => h.book.id === target.id);
+  assert.ok(hit, '连写查询应命中该书');
+  assert.equal(hit.direct, true, '紧凑命中应算直接命中');
+  assert.notEqual(hit.match, 'fuzzy');
+  assert.ok(hit.matched.length > 0);
+
+  // 带空格的老写法优先级更高：同一部书仍然排第一，且多打的「嘉慶」不该把结果降级
+  const spaced = search(idx, '嘉慶 贛州府志', { limit: 5 });
+  assert.equal(spaced.items[0]?.book.id, target.id);
+  assert.equal(spaced.items[0]?.direct, true, '书名精确命中不因多余的词降级');
+  assert.ok(spaced.items[0]!.score > hit.score, '分词命中的得分应高于连写紧凑命中');
+});
