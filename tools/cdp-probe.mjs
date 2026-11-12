@@ -259,6 +259,7 @@ if (process.env.FZ_CDP_SKIP_READER !== '1') {
     await sleep(1200);
     await check('阅读器画布已渲染', `!document.getElementById('r-canvas').classList.contains('hidden')`, (v) => v === true);
     await check('阅读器书签按钮初始未选中', `document.getElementById('r-mark').textContent`, (v) => /书签/.test(v) && !/已收藏/.test(v));
+    await check('阅读器 OCR 文本按钮已隐藏', `!!document.getElementById('r-ocr')`, (v) => v === false);
     await evaluate(ws, `document.getElementById('r-mark').click()`);
     await waitFor(`/已收藏/.test(document.getElementById('r-mark').textContent)`, 8000);
     await check('点书签后变为已收藏', `document.getElementById('r-mark').textContent`, (v) => /已收藏/.test(v));

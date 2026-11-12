@@ -143,12 +143,18 @@ const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) 
 /**
  * 识别入口总开关（暂时停用）。与 src/main/index.ts 里的同名常量保持一致。
  *
- * OCR 识别率还达不到可用程度，先把「全文识别」从界面摘掉：顶部「工具 → 全文识别」
- * 与详情页「识别本书」。只停识别——阅读器的「OCR 文本」视图、全文检索、倒排索引
- * 与自动同步都照常，已有的 data/ocr 与 .text-index 原样可用。
- * 恢复时把这个常量、main 里的同名常量、以及 index.html 里注释掉的 #btn-ocr 一起改回。
+ * OCR 识别率还达不到可用程度，先把「全文识别」从界面摘掉：顶部「工具 → 全文识别」、
+ * 详情页「识别本书」，以及阅读器工具栏的「OCR 文本」。只停识别——阅读器的 OCR 文本
+ * 视图、全文检索、倒排索引与自动同步都照常，已有的 data/ocr 与 .text-index 原样可用。
+ * 恢复时把这个常量、main 里的同名常量、以及 index.html 里注释掉的两处按钮一起改回。
  */
 const OCR_RECOGNITION_ENABLED = false;
+
+/**
+ * 阅读器的「OCR 文本」按钮。识别入口停用后它不在 DOM 里，所有引用都得容空；
+ * 文本视图本身还在，全文命中照样能跳进 OCR 模式。
+ */
+const ocrModeBtn = (): HTMLButtonElement | null => document.getElementById('r-ocr') as HTMLButtonElement | null;
 
 const state = {
   q: '',
@@ -1168,7 +1174,7 @@ function setReaderMode(mode: 'pdf' | 'ocr', render = true): void {
   if (mode === 'ocr' && !readerOcrPages) return;
   readerMode = mode;
   $('r-pdf').classList.toggle('on', mode === 'pdf');
-  $('r-ocr').classList.toggle('on', mode === 'ocr');
+  ocrModeBtn()?.classList.toggle('on', mode === 'ocr');
   $('r-fit').classList.toggle('hidden', mode === 'ocr');
   if (mode === 'pdf') $('r-text').classList.add('hidden');
   const total = readerLimit();
@@ -1207,9 +1213,12 @@ async function showReader(
   readerMode = 'pdf';
   readerOcrPages = 0;
   $('r-pdf').classList.add('on');
-  $('r-ocr').classList.remove('on');
-  $<HTMLButtonElement>('r-ocr').disabled = true;
-  $('r-ocr').title = '这本书还没有 OCR 文本';
+  const ocrBtn0 = ocrModeBtn();
+  if (ocrBtn0) {
+    ocrBtn0.classList.remove('on');
+    ocrBtn0.disabled = true;
+    ocrBtn0.title = '这本书还没有 OCR 文本';
+  }
   $('r-fit').classList.remove('hidden');
   $('r-text').classList.add('hidden');
   $('r-text').innerHTML = '';
@@ -1234,9 +1243,12 @@ async function showReader(
   const ocrInfo = await window.fz.ocrInfo(fid);
   if (seq === readerSeq && ocrInfo.ok && ocrInfo.pages) {
     readerOcrPages = ocrInfo.pages;
-    $<HTMLButtonElement>('r-ocr').disabled = false;
     $('r-q').classList.remove('hidden');
-    $('r-ocr').title = `看 OCR 识别出的文字（共 ${ocrInfo.pages} 页${ocrInfo.done ? '' : '，整本未识别完'}）`;
+    const ocrBtn1 = ocrModeBtn();
+    if (ocrBtn1) {
+      ocrBtn1.disabled = false;
+      ocrBtn1.title = `看 OCR 识别出的文字（共 ${ocrInfo.pages} 页${ocrInfo.done ? '' : '，整本未识别完'}）`;
+    }
     $('r-mode').textContent += ` · OCR ${ocrInfo.pages}页`;
   }
 
@@ -1342,7 +1354,7 @@ $('r-mark').addEventListener('click', async () => {
 });
 $('r-close').addEventListener('click', () => void closeReader());
 $('r-pdf').addEventListener('click', () => setReaderMode('pdf'));
-$('r-ocr').addEventListener('click', () => setReaderMode('ocr'));
+ocrModeBtn()?.addEventListener('click', () => setReaderMode('ocr'));
 $<HTMLInputElement>('r-q').addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
   e.preventDefault();
