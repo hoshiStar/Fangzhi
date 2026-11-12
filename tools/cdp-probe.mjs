@@ -253,6 +253,9 @@ if (process.env.FZ_CDP_SKIP_READER !== '1') {
   await evaluate(ws, `document.querySelector('.book')?.click()`);
   await waitFor(`!!document.querySelector('.detail .file .read')`);
   const hasLocal = await evaluate(ws, `!!document.querySelector('.detail .file .read')`);
+  // pdf.js 只对 http(s) 发 Range，地址必须落在本机 http 服务上，不能退回自定义协议
+  await check('阅读器地址走本机 http', `window.fz.readerResolve(document.querySelector('.detail .file .read')?.dataset.fid ?? '')`,
+    (v) => /^http:\/\/127\.0\.0\.1:\d+\/read\?fid=[^&]+&t=[0-9a-f]{32}$/.test(v?.url ?? ''));
   if (hasLocal) {
     await evaluate(ws, `document.querySelector('.detail .file .read').click()`);
     await waitFor(`!document.getElementById('reader').classList.contains('hidden') && !!document.getElementById('r-mark')`, 20000);

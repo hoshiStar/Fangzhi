@@ -15,7 +15,7 @@ import type { SearchFilters } from '@fangzhi/core';
 import { CookieStore } from './cookies.ts';
 import { DownloadManager } from './download.ts';
 import type { DlItem } from './download.ts';
-import { findLocalPath, registerReader, registerReaderSchemes } from './reader.ts';
+import { findLocalPath, startReaderServer } from './reader.ts';
 import type { ReaderDeps } from './reader.ts';
 import { createOcrReader } from './ocr.ts';
 import { createFulltextSearch } from './fulltext.ts';
@@ -31,8 +31,9 @@ import { createLibrary } from './library.ts';
 const testUserData = process.env.FZ_USER_DATA_DIR;
 if (testUserData) app.setPath('userData', resolve(testUserData));
 
-// fzpdf 必须在 app ready 之前声明为特权 scheme，否则 fetch / 流式响应都不可用。
-registerReaderSchemes();
+// 阅读器字节走 127.0.0.1 上的本机 http（pdf.js 只对 http(s) 做 Range 分段请求），
+// 服务在 whenReady 里才起，这里先占位。
+let readerServer: Awaited<ReturnType<typeof startReaderServer>> | null = null;
 
 let win: BrowserWindow | null = null;
 let idx: GazetteerIndex | null = null;
@@ -526,13 +527,14 @@ function registerIpc(): void {
     return { ok: true, dir: settings.downloadDir };
   });
 
-  /** 控制面：告诉渲染进程「能不能读、走本地还是在线、拿哪个 URL」。数据面走 fzpdf:// */
+  /** 控制面：告诉渲染进程「能不能读、走本地还是在线、拿哪个 URL」。数据面走本机 http */
   ipcMain.handle('reader-resolve', (_e, fid: string) => {
     const rec = idx?.files.find((f) => f.fid === fid);
     if (!rec) return { ok: false, error: '索引里没有这个文件' };
     if (rec.ext !== 'pdf') return { ok: false, error: `内置阅读器只支持 PDF，这是 .${rec.ext}` };
     if (rec.isArchivePart) return { ok: false, error: '这是分卷文件，请下载整组后阅读' };
-    const url = `fzpdf://read?fid=${encodeURIComponent(fid)}`;
+    if (!readerServer) return { ok: false, error: '阅读服务还没就绪，稍等再试' };
+    const url = `${readerServer.origin}/read?fid=${encodeURIComponent(fid)}&t=${readerServer.token}`;
     if (findLocalPath(readerDeps(), rec)) return { ok: true, mode: 'local', size: rec.size, url };
     if (!cookies.has()) return { ok: false, needCookie: true };
     return { ok: true, mode: 'online', size: rec.size, url };
@@ -658,7 +660,7 @@ function createWindow(): void {
   win.on('closed', () => { win = null; });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   loadSettings();
   bookOverrides = loadBookOverrides();
   const r = loadIndex();
@@ -695,7 +697,12 @@ app.whenReady().then(() => {
   });
   library = createLibrary(join(app.getPath('userData'), 'library.json'), { index: () => idx });
   registerIpc();
-  registerReader(readerDeps());
+  // 阅读服务必须在开窗之前就好，否则第一次点「阅读」会撞上 null
+  try {
+    readerServer = await startReaderServer(readerDeps());
+  } catch (e) {
+    dialog.showErrorBox('阅读服务启动失败', (e as Error).message);
+  }
   createWindow();
   if (!r.ok) dialog.showErrorBox('索引未就绪', r.error ?? '');
   // 启动时补一次：上次识别完还没来得及同步就退出了，这里补上增量
@@ -703,7 +710,11 @@ app.whenReady().then(() => {
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
   // worker 线程不会自己退出，退出前显式收掉，避免残留进程
-  app.on('before-quit', () => fulltext.dispose());
+  app.on('before-quit', () => {
+    readerServer?.close();
+    readerServer = null;
+    fulltext.dispose();
+  });
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

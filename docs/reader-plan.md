@@ -172,7 +172,9 @@ getDocument({url:                 protocol.handle('fzpdf')
 
 关键点：**渲染进程只发 `fzpdf://` 请求**；cookie、真实直链、文件名全在 main。
 
-### 6.2 自定义协议 `fzpdf://`（greenfield，main 里目前没有任何 protocol/session/webRequest 代码）
+### 6.2 字节通道：最终实现是本机 HTTP，不是自定义协议
+
+> **实施变更（2026-11-12）**：这一节最初设计成自定义协议 `fzpdf://`，实际做完后发现一个硬伤——pdf.js 只在 `isHttp` 为真时才发 Range 请求（`validateRangeRequestCapabilities` 里 `!isHttp` 直接判定不支持分段），于是在线阅读必然把整本 PDF 一次性取回内存，一本几百 MB 的扫描件打开就吃掉同等内存。因此改成在 `127.0.0.1` 上开临时 HTTP 服务（`startReaderServer`，端口随机、URL 带进程级 token、校验 `Host` 防 DNS rebinding），CSP 的 `connect-src` 放行 `http://127.0.0.1:*`。实测打开 11.4MB 的 PDF 只会按需取几个 64KB 块（`Range: bytes=…` → `206`），不再是整本。下文保留原始方案作为背景记录。
 
 Electron 44.3.0（`apps/desktop/package.json` devDep）支持 `protocol.handle`。两处注册，**时机不能错**：
 

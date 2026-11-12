@@ -20,7 +20,7 @@
     "build:text-index": "node tools/build-text-index.ts",
     "build:mini": "node apps/miniprogram/build.mjs",
     "typecheck": "tsc -p packages/core/tsconfig.json --noEmit",
-    "test": "node --test tests/core.test.ts tests/download.test.ts tests/library.test.ts tests/fulltext.test.ts tests/text-index.test.ts",
+    "test": "node --test tests/core.test.ts tests/download.test.ts tests/library.test.ts tests/fulltext.test.ts tests/text-index.test.ts tests/reader.test.ts",
     "verify": "npm run typecheck && npm run typecheck --workspace @fangzhi/desktop && npm test && node apps/miniprogram/smoke.cjs"
   },
   "devDependencies": {

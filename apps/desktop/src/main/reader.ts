@@ -1,4 +1,7 @@
-import { protocol } from 'electron';
+import { createServer } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { randomBytes } from 'node:crypto';
 import { createReadStream, statSync } from 'node:fs';
 import { Readable } from 'node:stream';
 import { fetchShareToken, parseShareUrl, QuarkShareError, refreshShareFidTokens } from '@fangzhi/core/crawl';
@@ -25,20 +28,23 @@ interface LinkEntry {
 const LINK_TTL = 4 * 60_000;
 
 /**
- * 必须在 app ready 之前调用。fzpdf 只承载「流字节」，URL 里只有 fid：
- * cookie、真实直链、文件名都由 main 从索引现查，绝不进 URL。
+ * 跨源头。渲染页面是 fz:// 或 file://，请求 127.0.0.1 属跨源，pdf.js 还带着
+ * Range 头（非简单请求），所以既要放行预检，也要把 Content-Range / Content-Length
+ * 暴露出去——读不到这几个头，pdf.js 会判定不支持分段，又退化成整本取。
  */
-export function registerReaderSchemes(): void {
-  protocol.registerSchemesAsPrivileged([
-    {
-      scheme: 'fzpdf',
-      privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
-    },
-  ]);
-}
+const CORS_HEADERS: Record<string, string> = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+  'access-control-allow-headers': 'range, if-range',
+  'access-control-expose-headers': 'content-length, content-range, accept-ranges, content-type, content-disposition',
+};
 
 const acao = (h: Headers): Headers => {
   h.set('access-control-allow-origin', '*');
+  h.set(
+    'access-control-expose-headers',
+    'content-length, content-range, accept-ranges, content-type, content-disposition',
+  );
   return h;
 };
 
@@ -191,7 +197,7 @@ export function createReader(deps: ReaderDeps): (req: Request) => Promise<Respon
     const local = findLocalPath(deps, rec);
     if (local) return serveLocal(local, method, range);
 
-    // 2) 在线直读：main 拿着 cookie 去 CDN 取流，renderer 只看到 fzpdf://
+    // 2) 在线直读：main 拿着 cookie 去 CDN 取流，renderer 只看到本机 http
     if (!deps.hasCookie()) return json(401, { error: '在线阅读需要夸克 cookie' });
     try {
       const entry = await link(rec);
@@ -203,7 +209,93 @@ export function createReader(deps: ReaderDeps): (req: Request) => Promise<Respon
   };
 }
 
-export function registerReader(deps: ReaderDeps): void {
+/**
+ * 本机 HTTP 阅读服务。
+ *
+ * 为什么不用自定义协议：pdf.js 只在 `isHttp` 为真时才发 Range 请求
+ * （validateRangeRequestCapabilities 里 `!isHttp` 直接判定不支持分段），
+ * 走自定义协议必然把整本 PDF 一次性取回内存。换成 127.0.0.1 上的 http 之后，
+ * 翻到哪读到哪，一本几百 MB 的扫描件也不会一打开就吃掉同等内存。
+ *
+ * 只监听回环、端口随机、URL 必须带本进程生成的 token，并校验 Host 防 DNS rebinding。
+ */
+export interface ReaderServer {
+  /** http://127.0.0.1:<port> */
+  origin: string;
+  /** 拼进 URL 的随机串；渲染层不通过 IPC 拿到它就要不到字节。 */
+  token: string;
+  close(): void;
+}
+
+export function startReaderServer(deps: ReaderDeps): Promise<ReaderServer> {
   const handler = createReader(deps);
-  protocol.handle('fzpdf', handler);
+  const token = randomBytes(16).toString('hex');
+  const server = createServer((req, res) => { void onRequest(req, res); });
+
+  async function onRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const method = req.method ?? 'GET';
+    // pdf.js 带 Range 头，属非简单请求，浏览器会先发预检
+    if (method === 'OPTIONS') {
+      res.writeHead(204, CORS_HEADERS);
+      res.end();
+      return;
+    }
+    if (method !== 'GET' && method !== 'HEAD') {
+      res.writeHead(405, { ...CORS_HEADERS, allow: 'GET, HEAD, OPTIONS' });
+      res.end();
+      return;
+    }
+    const port = (server.address() as AddressInfo).port;
+    // Host 必须是这一份服务，挡掉把域名解析到 127.0.0.1 的页面
+    if (req.headers.host !== `127.0.0.1:${port}`) {
+      res.writeHead(403, CORS_HEADERS);
+      res.end('forbidden');
+      return;
+    }
+    const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
+    if (url.pathname !== '/read' || url.searchParams.get('t') !== token) {
+      res.writeHead(403, CORS_HEADERS);
+      res.end('forbidden');
+      return;
+    }
+    const headers = new Headers();
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (typeof v === 'string') headers.set(k, v);
+      else if (Array.isArray(v)) headers.set(k, v.join(', '));
+    }
+    let response: Response;
+    try {
+      response = await handler(new Request(url, { method, headers }));
+    } catch (e) {
+      res.writeHead(500, CORS_HEADERS);
+      res.end((e as Error).message);
+      return;
+    }
+    res.statusCode = response.status;
+    response.headers.forEach((v, k) => res.setHeader(k, v));
+    if (!response.body) {
+      res.end();
+      return;
+    }
+    const body = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
+    body.on('error', () => res.destroy());
+    res.on('close', () => body.destroy());
+    body.pipe(res);
+  }
+
+  return new Promise<ReaderServer>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as AddressInfo).port;
+      resolve({
+        origin: `http://127.0.0.1:${port}`,
+        token,
+        close: () => {
+          // 复用连接不掐掉的话，server.close() 会等 keep-alive 超时才真正结束
+          server.closeAllConnections();
+          server.close();
+        },
+      });
+    });
+  });
 }
