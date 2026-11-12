@@ -18,7 +18,7 @@
 ## 会访问真实网络
 
 - `verify-crawl-resume.ts`：真实爬取夸克分享，必须显式加 `--run`。
-- `tools/cdp-probe.mjs`：默认只读界面检查；账号与下载写操作需要 `FZ_CDP_ALLOW_COOKIE_MUTATION=1`，真跑识别需要 `FZ_CDP_RUN_OCR=1`，通过界面重建全文索引需要 `FZ_CDP_BUILD_INDEX=1`，且都只能在独立 `FZ_USER_DATA_DIR` 下运行。
+- `tools/cdp-probe.mjs`：默认只读界面检查；账号与下载写操作需要 `FZ_CDP_ALLOW_COOKIE_MUTATION=1`，通过界面重建全文索引需要 `FZ_CDP_BUILD_INDEX=1`，且都只能在独立 `FZ_USER_DATA_DIR` 下运行。全文识别入口暂时停用，探针改为断言「入口已隐藏 + IPC 回停用」；`FZ_CDP_RUN_OCR=1` 暂时被忽略（恢复识别后原步骤在注释里）。
 
 ## OCR
 

@@ -140,6 +140,16 @@ interface LibraryFile {
 const PAGE = 50;
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
+/**
+ * 识别入口总开关（暂时停用）。与 src/main/index.ts 里的同名常量保持一致。
+ *
+ * OCR 识别率还达不到可用程度，先把「全文识别」从界面摘掉：顶部「工具 → 全文识别」
+ * 与详情页「识别本书」。只停识别——阅读器的「OCR 文本」视图、全文检索、倒排索引
+ * 与自动同步都照常，已有的 data/ocr 与 .text-index 原样可用。
+ * 恢复时把这个常量、main 里的同名常量、以及 index.html 里注释掉的 #btn-ocr 一起改回。
+ */
+const OCR_RECOGNITION_ENABLED = false;
+
 const state = {
   q: '',
   filters: { provinces: [], eras: [], zhiTypes: [], exts: [], allTermsOnly: false } as SearchFilters & { provinces: string[]; eras: string[]; zhiTypes: string[]; exts: string[]; allTermsOnly: boolean },
@@ -309,7 +319,7 @@ async function selectBook(id: string): Promise<void> {
     <div class="acts">
       <button id="d-share" class="primary">在夸克打开分享页</button>
       <button id="d-dl">下载本书</button>
-      <button id="d-ocr" class="ghost" disabled title="只识别已下载到本地的 PDF">识别本书</button>
+      ${OCR_RECOGNITION_ENABLED ? '<button id="d-ocr" class="ghost" disabled title="只识别已下载到本地的 PDF">识别本书</button>' : ''}
       <button id="d-edit" class="ghost">校正书目</button>
     </div>
     <h3>文件</h3>
@@ -336,18 +346,21 @@ async function selectBook(id: string): Promise<void> {
   }
   const editBtn = panel.querySelector<HTMLButtonElement>('#d-edit');
   if (editBtn) editBtn.onclick = () => overrideModal(b, d.override);
-  const ocrBtn = panel.querySelector<HTMLButtonElement>('#d-ocr');
-  void window.fz.dlLocal(d.files.map((f) => f.fid)).then((local) => {
-    if (state.selected !== id || !ocrBtn) return;
-    // 只有 PDF 能识别；分卷文件本身不是完整文档，跳过。
-    const localPdf = d.files
-      .filter((f) => f.ext === 'pdf' && !f.isArchivePart && local.includes(f.fid))
-      .map((f) => f.fid);
-    if (!localPdf.length) return;
-    ocrBtn.disabled = false;
-    ocrBtn.title = `识别这本书在本地的 ${localPdf.length} 个 PDF`;
-    ocrBtn.onclick = () => void ocrBook(localPdf);
-  });
+  // 识别入口暂时停用：按钮本身不渲染，这段本地文件探测（只为判断能不能识别）也不用跑
+  if (OCR_RECOGNITION_ENABLED) {
+    const ocrBtn = panel.querySelector<HTMLButtonElement>('#d-ocr');
+    void window.fz.dlLocal(d.files.map((f) => f.fid)).then((local) => {
+      if (state.selected !== id || !ocrBtn) return;
+      // 只有 PDF 能识别；分卷文件本身不是完整文档，跳过。
+      const localPdf = d.files
+        .filter((f) => f.ext === 'pdf' && !f.isArchivePart && local.includes(f.fid))
+        .map((f) => f.fid);
+      if (!localPdf.length) return;
+      ocrBtn.disabled = false;
+      ocrBtn.title = `识别这本书在本地的 ${localPdf.length} 个 PDF`;
+      ocrBtn.onclick = () => void ocrBook(localPdf);
+    });
+  }
   panel.querySelectorAll<HTMLButtonElement>('.file .read').forEach((el) => {
     el.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -534,7 +547,7 @@ async function textIndexModal(): Promise<void> {
       不必每次都把上千本书的正文读一遍。当前 <b>${initial.textFiles}</b> 个文件有识别文本。</p>
     <div id="ti-state"></div>
     <label class="row ti-auto"><input type="checkbox" id="ti-auto" ${initial.auto ? 'checked' : ''}>
-      <span>识别完成后自动更新索引（只重扫变过的文件，通常几十毫秒）</span></label>
+      <span>文本有变动时自动更新索引（只重扫变过的文件，通常几十毫秒）</span></label>
     <div id="ti-sync"></div>
     <div class="row">
       <button id="ti-sync-now" class="ghost">立即同步</button>
@@ -563,7 +576,7 @@ async function textIndexModal(): Promise<void> {
     }
     const last = s.lastSync;
     if (!last) {
-      syncBox.innerHTML = `<div class="row"><span class="thint">${s.auto ? '自动同步已开启：识别完成、启动、换目录时会自动比对增量。' : '自动同步已关闭，索引只在手动重建时更新。'}</span></div>`;
+      syncBox.innerHTML = `<div class="row"><span class="thint">${s.auto ? '自动同步已开启：启动、换数据目录、文本变动时会自动比对增量。' : '自动同步已关闭，索引只在手动重建时更新。'}</span></div>`;
       return;
     }
     const at = new Date(last.at);
@@ -1426,7 +1439,9 @@ for (const b of document.querySelectorAll<HTMLElement>('.toolmenu button')) {
   b.addEventListener('click', () => b.closest('details')?.removeAttribute('open'));
 }
 $('btn-cookie').addEventListener('click', () => void cookieModal());
-$('btn-ocr').addEventListener('click', () => void ocrModal());
+// 识别入口暂时停用：index.html 里 #btn-ocr 已被注释掉，这里也不挂监听，
+// 否则 $() 取到 null 会让整个渲染层在启动时报错。
+if (OCR_RECOGNITION_ENABLED) $('btn-ocr').addEventListener('click', () => void ocrModal());
 $('btn-textindex').addEventListener('click', () => void textIndexModal());
 $('btn-lib').addEventListener('click', () => void libraryModal());
 $('btn-dl').addEventListener('click', async () => {

@@ -68,6 +68,39 @@ let library: ReturnType<typeof createLibrary>;
 let bookOverrides: BookOverrideFile = emptyBookOverrides();
 let settings: { downloadDir: string; dataDir?: string; autoTextIndex?: boolean } = { downloadDir: '' };
 
+/**
+ * 识别入口总开关（暂时停用）。
+ *
+ * OCR 识别率还达不到可用程度，先把「全文识别」这条线整条关掉：界面隐藏入口
+ * （见 renderer/app.ts 的同名开关与 index.html 里注释掉的 #btn-ocr），IPC 一律
+ * 回「已停用」，连运行时探测都不做，不会拉子进程。
+ *
+ * 注意只停「识别」：阅读器的「OCR 文本」视图、全文检索、倒排索引与自动同步都
+ * 照常工作，已有的 data/ocr 与 .text-index 原样可用，不是把 OCR 相关一律摘掉。
+ * 恢复时把这里和 src/renderer/app.ts 的 OCR_RECOGNITION_ENABLED 一起改回 true。
+ */
+const OCR_RECOGNITION_ENABLED = false;
+const OCR_DISABLED_NOTE = '识别功能暂时停用（当前识别率不达标）';
+
+/** 停用时给界面的假状态：形状与 OcrJobState 一致，避免调用方解构出错。 */
+function ocrDisabledStatus() {
+  return {
+    job: {
+      status: 'idle' as const,
+      runtime: '' as const,
+      fileIndex: 0,
+      fileTotal: 0,
+      currentName: '',
+      page: 0,
+      pageTotal: 0,
+      doneFiles: 0,
+      log: [OCR_DISABLED_NOTE],
+    },
+    runtime: { runtime: '' as const, label: '已停用', note: OCR_DISABLED_NOTE },
+    disabled: true,
+  };
+}
+
 function settingsPath(): string { return join(app.getPath('userData'), 'settings.json'); }
 function overridesPath(): string { return join(app.getPath('userData'), 'book-overrides.json'); }
 
@@ -565,9 +598,17 @@ function registerIpc(): void {
   });
 
   /** 内置识别任务：启动前先探测运行时，跑完自动重载索引。 */
-  ipcMain.handle('ocr-runner-status', () => ocrRunner.status());
-  ipcMain.handle('ocr-runner-start', (_e, opts: Parameters<typeof ocrRunner.start>[0]) => ocrRunner.start(opts));
-  ipcMain.handle('ocr-runner-cancel', () => ocrRunner.cancel());
+  // 识别入口暂时停用（见文件顶部 OCR_RECOGNITION_ENABLED）：三个 handle 一律短路，
+  // 不起子进程也不做 uv/python 探测。恢复时删掉条件分支即可，原实现保持原样。
+  ipcMain.handle('ocr-runner-status', () => (
+    OCR_RECOGNITION_ENABLED ? ocrRunner.status() : ocrDisabledStatus()
+  ));
+  ipcMain.handle('ocr-runner-start', (_e, opts: Parameters<typeof ocrRunner.start>[0]) => (
+    OCR_RECOGNITION_ENABLED ? ocrRunner.start(opts) : { ok: false as const, error: OCR_DISABLED_NOTE }
+  ));
+  ipcMain.handle('ocr-runner-cancel', () => (
+    OCR_RECOGNITION_ENABLED ? ocrRunner.cancel() : { ok: false as const, error: OCR_DISABLED_NOTE }
+  ));
 
   /** 书签与最近阅读：只存在本机，不进索引，跟随用户目录走。 */
   ipcMain.handle('marks-list', () => library.list());

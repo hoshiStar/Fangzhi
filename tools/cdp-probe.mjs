@@ -189,16 +189,12 @@ await waitFor(`!!document.querySelector('.empty')`);
 await check('无结果提示', `document.querySelector('.empty')?.textContent`, (v) => /没有匹配/.test(v));
 await check('无结果时收起旧详情', `document.getElementById('detail').classList.contains('hidden')`, (v) => v === true);
 
-// 工具菜单、全文识别与内置识别运行时
-await evaluate(ws, `document.getElementById('btn-ocr').click()`);
-await waitFor(`!!document.getElementById('x-start')`);
-// 运行时探测在弹层打开后才异步返回，等它落地再断言
-await waitFor(`/可用|不可用/.test(document.getElementById('x-ready')?.textContent ?? '')`, 120000);
-await check('全文识别覆盖说明', `document.getElementById('modal-card').textContent`, (v) => /全文检索/.test(v) && /10\/4600/.test(v));
-await check('识别运行时已探测', `document.getElementById('modal-card').textContent`, (v) => /uv run|项目 \.venv|python|不可用/.test(v));
-await check('识别任务控件就绪', `!!document.getElementById('x-start') && !!document.getElementById('x-limit') && !!document.getElementById('x-fill')`, (v) => v === true);
-await evaluate(ws, `document.getElementById('x-close').click()`);
-await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+// 全文识别入口已停用（识别率暂时不达标）：按钮不渲染，IPC 一律回「已停用」。
+// 只停识别——下面的全文索引面板与全文检索仍应正常，恢复识别时把这里改回弹层断言。
+await check('全文识别入口已隐藏', `!!document.getElementById('btn-ocr')`, (v) => v === false);
+await check('详情页识别按钮已隐藏', `!!document.getElementById('d-ocr')`, (v) => v === false);
+await check('识别启动被拒', `window.fz.ocrRunnerStart({})`, (v) => v?.ok === false && /停用/.test(v.error ?? ''));
+await check('识别状态标记停用', `window.fz.ocrRunnerStatus()`, (v) => v?.disabled === true);
 
 // 全文索引面板（只读状态；重建索引会写数据目录，留给手工或 FZ_CDP_BUILD_INDEX）
 await evaluate(ws, `document.getElementById('btn-textindex').click()`);
@@ -231,18 +227,23 @@ await check('空态提示', `document.getElementById('modal-card').textContent`,
 await evaluate(ws, `document.getElementById('l-close').click()`);
 await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
 
-// 真跑一本识别（默认关闭：慢，且会往真实数据目录写 OCR 结果）
+// 真跑一本识别（默认关闭：慢，且会往真实数据目录写 OCR 结果）。
+// 识别入口暂时停用（见 README「OCR」），这段检查一并停掉；原来的步骤留在注释里，
+// 恢复识别（OCR_RECOGNITION_ENABLED = true + 放回 #btn-ocr）后再放出来。
 if (process.env.FZ_CDP_RUN_OCR === '1') {
-  await evaluate(ws, `document.getElementById('btn-ocr').click()`);
-  await waitFor(`!!document.getElementById('x-start')`);
-  await evaluate(ws, `(()=>{document.getElementById('x-limit').value='1';document.getElementById('x-pages').value='1';})()`);
-  await evaluate(ws, `document.getElementById('x-start').click()`);
-  await waitFor(`/已完成|失败/.test(document.getElementById('x-line').textContent)`, 180000);
-  await check('内置识别跑完一本', `document.getElementById('x-line').textContent`, (v) => /已完成/.test(v));
-  await check('识别进度有页码反馈', `document.getElementById('x-log').textContent`, (v) => /page \d+\/\d+|没有待识别|已整本完成|-> ocr/.test(v));
-  await evaluate(ws, `document.getElementById('x-close').click()`);
-  await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+  console.log('SKIP  FZ_CDP_RUN_OCR 已忽略：全文识别入口暂时停用');
 }
+// if (process.env.FZ_CDP_RUN_OCR === '1') {
+//   await evaluate(ws, `document.getElementById('btn-ocr').click()`);
+//   await waitFor(`!!document.getElementById('x-start')`);
+//   await evaluate(ws, `(()=>{document.getElementById('x-limit').value='1';document.getElementById('x-pages').value='1';})()`);
+//   await evaluate(ws, `document.getElementById('x-start').click()`);
+//   await waitFor(`/已完成|失败/.test(document.getElementById('x-line').textContent)`, 180000);
+//   await check('内置识别跑完一本', `document.getElementById('x-line').textContent`, (v) => /已完成/.test(v));
+//   await check('识别进度有页码反馈', `document.getElementById('x-log').textContent`, (v) => /page \d+\/\d+|没有待识别|已整本完成|-> ocr/.test(v));
+//   await evaluate(ws, `document.getElementById('x-close').click()`);
+//   await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+// }
 
 // 阅读器里的书签闭环：只有本地已下载的 PDF 能离线打开，读不到就跳过。
 // 不写真实用户目录（书签落在 FZ_USER_DATA_DIR 指定的隔离目录里）。
