@@ -342,13 +342,39 @@ async function selectBook(id: string): Promise<void> {
   if (btn && state.shareUrl) btn.onclick = () => window.fz.openExternal(state.shareUrl);
   else if (btn) btn.remove();
   const dlBtn = panel.querySelector<HTMLButtonElement>('#d-dl');
+  const dlOneBtns = [...panel.querySelectorAll<HTMLButtonElement>('.file .dlone')];
+  /** 真正会被下载的文件（排除噪声与没有分享 token 的），和 enqueueBook 的判断保持一致。 */
+  const downloadable = d.files.filter((f) => !f.isNoise && f.shareFidToken);
+  /**
+   * 本地已有哪几个文件。点按钮前必须知道答案：决定显示「下载」还是「更新」，
+   * 也决定要不要先弹确认。null 表示还在问，这时点了不动，免得静默覆盖旧文件。
+   */
+  let localFids: Set<string> | null = null;
+  void window.fz.dlLocal(d.files.map((f) => f.fid)).then((local) => {
+    if (state.selected !== id) return;
+    localFids = new Set(local);
+    // 顶部按钮：整本语义
+    if (dlBtn && downloadable.some((f) => localFids!.has(f.fid))) dlBtn.textContent = '更新本书';
+    // 文件条目：和顶部保持一致，本地已有就显示「更新」
+    for (const el of dlOneBtns) {
+      if (!localFids.has(el.dataset.fid!)) continue;
+      el.textContent = '更新';
+      el.title = '本地已有这份文件，点「更新」会重新下载并覆盖';
+    }
+  });
+
   if (dlBtn) {
-    dlBtn.onclick = () => void enqueueBook(d.files);
-    // 这本书已有文件在本地时，按钮语义变成「更新」——重新下载会覆盖旧文件。
-    void window.fz.dlLocal(d.files.map((f) => f.fid)).then((local) => {
-      if (state.selected !== id) return;
-      if (local.length) dlBtn.textContent = '更新本书';
-    });
+    dlBtn.onclick = () => {
+      if (!localFids) return;
+      const local = localFids;
+      void (async () => {
+        const have = downloadable.filter((f) => local.has(f.fid)).length;
+        if (have && !(await confirmUpdate(
+          `「${b.title}」有 ${have} 个文件已在本地。更新会重新下载这 ${have} 个文件，覆盖本地现有版本。`,
+        ))) return;
+        await enqueueBook(d.files);
+      })();
+    };
   }
   const editBtn = panel.querySelector<HTMLButtonElement>('#d-edit');
   if (editBtn) editBtn.onclick = () => overrideModal(b, d.override);
@@ -375,13 +401,21 @@ async function selectBook(id: string): Promise<void> {
       void openReader(fid, rec?.name ?? '');
     });
   });
-  panel.querySelectorAll<HTMLButtonElement>('.file .dlone').forEach((el) => {
+  for (const el of dlOneBtns) {
     el.addEventListener('click', (ev) => {
       ev.stopPropagation();
       const rec = d.files.find((x) => x.fid === el.dataset.fid);
-      if (rec) void enqueueBook([rec]);
+      if (!rec) return;
+      void (async () => {
+        if (!localFids) return;
+        // 条目已下载时按钮是「更新」，覆盖前同样要确认
+        if (localFids.has(rec.fid) && !(await confirmUpdate(
+          `「${rec.name}」已下载到本地。更新会重新下载这个文件，覆盖本地现有版本。`,
+        ))) return;
+        await enqueueBook([rec]);
+      })();
     });
-  });
+  }
 }
 
 /**
@@ -513,7 +547,17 @@ function crawlModal(): void {
 }
 
 /* ---------- 账号 cookie ---------- */
+/**
+ * 弹窗收尾钩子。点遮罩、按 Esc 或换一个弹窗顶掉当前这个时，挂在里面的
+ * Promise（比如「确认更新」）得跟着结束，否则一直悬着。
+ */
+let modalOnClose: (() => void) | null = null;
+
 function openModal(html: string): HTMLElement {
+  // 上一个弹窗被顶掉前先让它收尾
+  const hook = modalOnClose;
+  modalOnClose = null;
+  hook?.();
   $('modal').classList.remove('hidden');
   const card = $('modal-card');
   card.innerHTML = html;
@@ -522,6 +566,36 @@ function openModal(html: string): HTMLElement {
 function closeModal(): void {
   $('modal').classList.add('hidden');
   $('modal-card').innerHTML = '';
+  const hook = modalOnClose;
+  modalOnClose = null;
+  hook?.();
+}
+
+/**
+ * 覆盖本地文件前的确认。返回 true 表示用户点了确认；
+ * 点取消、点遮罩、按 Esc 一律返回 false。
+ */
+function confirmUpdate(detail: string, okText = '确认更新'): Promise<boolean> {
+  const card = openModal(`
+    <h2>确认更新</h2>
+    <p>${detail}</p>
+    <div class="row">
+      <button id="u-ok" class="primary">${okText}</button>
+      <button id="u-cancel" class="ghost">取消</button>
+    </div>`);
+  return new Promise<boolean>((resolve) => {
+    let answered = false;
+    const settle = (value: boolean): void => {
+      if (answered) return;
+      answered = true;
+      modalOnClose = null;
+      closeModal();
+      resolve(value);
+    };
+    modalOnClose = () => { if (!answered) resolve(false); };
+    card.querySelector('#u-ok')!.addEventListener('click', () => settle(true));
+    card.querySelector('#u-cancel')!.addEventListener('click', () => settle(false));
+  });
 }
 
 /* ---------- 全文倒排索引 ---------- */

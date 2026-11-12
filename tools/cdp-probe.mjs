@@ -267,6 +267,27 @@ if (process.env.FZ_CDP_SKIP_READER !== '1') {
     // 面板里应出现这条书签，并且最近阅读已记一条
     await evaluate(ws, `document.getElementById('r-close').click()`);
     await sleep(300);
+    await check('详情页下载按钮语义', `document.getElementById('d-dl')?.textContent`, (v) => /下载本书|更新本书/.test(v ?? ''));
+    await check('文件条目下载按钮语义', `document.querySelector('.detail .file .dlone')?.textContent`, (v) => /^(下载|更新)$/.test(v ?? ''));
+    if (await evaluate(ws, `document.querySelector('.detail .file .dlone')?.textContent === '更新'`)) {
+      await evaluate(ws, `document.querySelector('.detail .file .dlone').click()`);
+      await waitFor(`!!document.getElementById('u-ok')`, 8000);
+      await check('更新前弹出确认', `document.getElementById('modal-card').textContent`,
+        (v) => /确认更新/.test(v) && /覆盖/.test(v));
+      const badgeBefore = await evaluate(ws, `document.getElementById('dl-badge')?.textContent ?? ''`);
+      await evaluate(ws, `document.getElementById('u-cancel').click()`);
+      await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+      await check('取消更新不入队', `document.getElementById('dl-badge')?.textContent ?? ''`, (v) => v === badgeBefore);
+      // 整本「更新本书」走的是另一条分支，同样要确认
+      await evaluate(ws, `document.getElementById('d-dl').click()`);
+      await waitFor(`!!document.getElementById('u-ok')`, 8000);
+      await check('整本更新前弹出确认', `document.getElementById('modal-card').textContent`,
+        (v) => /确认更新/.test(v) && /已在本地/.test(v));
+      await evaluate(ws, `document.getElementById('u-cancel').click()`);
+      await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+    } else {
+      console.log('SKIP  更新确认弹窗（这份文件不在本地）');
+    }
     await evaluate(ws, `document.getElementById('btn-lib').click()`);
     await waitFor(`!!document.getElementById('l-clear')`);
     await check('书签已落库', `document.querySelectorAll('.librow[data-kind="mark"]').length`, (v) => v >= 1);
