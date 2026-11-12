@@ -144,11 +144,21 @@ const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) 
  * 识别入口总开关（暂时停用）。与 src/main/index.ts 里的同名常量保持一致。
  *
  * OCR 识别率还达不到可用程度，先把「全文识别」从界面摘掉：顶部「工具 → 全文识别」、
- * 详情页「识别本书」，以及阅读器工具栏的「OCR 文本」。只停识别——阅读器的 OCR 文本
- * 视图、全文检索、倒排索引与自动同步都照常，已有的 data/ocr 与 .text-index 原样可用。
- * 恢复时把这个常量、main 里的同名常量、以及 index.html 里注释掉的两处按钮一起改回。
+ * 详情页「识别本书」，以及阅读器工具栏的「OCR 文本」（与下方的 FULLTEXT_ENABLED 一起）。
+ * 恢复时把这个常量、main 里的同名常量、以及 index.html 里注释掉的按钮一起改回。
  */
 const OCR_RECOGNITION_ENABLED = false;
+
+/**
+ * 全文检索与倒排索引总开关（暂时停用）。与 src/main/index.ts 里的同名常量保持一致。
+ *
+ * 本机 OCR 语料只有 10 个文件 × 6 页 = 60 页，书库却有 4600 个文件，搜出来几乎不可能是
+ * 要找的那一本。这里把消费侧也一起摘掉：搜索页的「全文命中」块、工具菜单「全文索引」、
+ * 阅读器的 OCR 文本视图与书内搜索、详情页「已识别 N」标注都按这个开关隐藏。
+ * 主进程同时短路了 search-text / text-index-* / ocr-info 等 IPC，不读 data/ocr 与 .text-index。
+ * 书目检索（书名/地名/志种/著者/文件名）不受影响。恢复时改回 true 并放开 index.html 里的按钮。
+ */
+const FULLTEXT_ENABLED = false;
 
 /**
  * 阅读器的「OCR 文本」按钮。识别入口停用后它不在 DOM 里，所有引用都得容空；
@@ -240,7 +250,8 @@ function bookMeta(b: BookRecord): string[] {
   if (b.edition) out.push(b.edition);
   out.push(`${b.fileCount} 册`);
   out.push(formatSize(b.totalSize));
-  if (b.ocrDone) out.push(`已识别 ${b.ocrDone}`);
+  // 「已识别 N」只对全文检索有意义，冻结期间不显示
+  if (FULLTEXT_ENABLED && b.ocrDone) out.push(`已识别 ${b.ocrDone}`);
   if (b.verified) out.push('已校正');
   else if (b.confidence < 0.4) out.push('待核对');
   return out;
@@ -429,7 +440,8 @@ async function run(): Promise<void> {
   const r = await window.fz.search(state.q, state.filters, PAGE, state.offset);
   if (mine !== runSeq) return;
   renderResults(r);
-  void renderTextHits(state.q, mine);
+  // 全文检索冻结期间连 IPC 都不发：搜索只剩书目维度
+  if (FULLTEXT_ENABLED) void renderTextHits(state.q, mine);
 }
 
 let textRunSeq = 0;
@@ -440,6 +452,12 @@ let textProgress: { scanned: number; total: number; q: string } | null = null;
 async function renderTextHits(q: string, mine: number): Promise<void> {
   const box = $('textlist');
   const token = ++textRunSeq;
+  // 开关关掉时兜底：容器藏起来，避免上一次的命中残留在页面上
+  if (!FULLTEXT_ENABLED) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
   if (q.trim().length < 2) {
     box.classList.add('hidden');
     box.innerHTML = '';
@@ -620,6 +638,8 @@ function syncSummary(stats?: IndexSyncStats): string {
 }
 
 async function textIndexModal(): Promise<void> {
+  // 全文索引冻结期间不打开面板（按钮也已从工具菜单摘掉），这里再兜一层
+  if (!FULLTEXT_ENABLED) return;
   const initial = await window.fz.textIndexStatus();
   const card = openModal(`
     <h2>全文索引</h2>
@@ -1484,8 +1504,10 @@ async function boot(): Promise<void> {
   state.ocrTotalFiles = ocrSummary.totalFiles;
   state.ocrTextFiles = ocrSummary.textFiles;
   state.ocrDoneFiles = ocrSummary.doneFiles;
+  // 状态栏不再报全文覆盖：冻结期间 ocrSummary 恒为零值，写上去只会显示「全文 0/0」
   $('status-right').textContent =
-    `${s.fileCount} 文件 · ${bookLabel} · 全文 ${ocrSummary.textFiles}/${ocrSummary.totalFiles} 文件` +
+    `${s.fileCount} 文件 · ${bookLabel}` +
+    (FULLTEXT_ENABLED ? ` · 全文 ${ocrSummary.textFiles}/${ocrSummary.totalFiles} 文件` : '') +
     ` · ${formatSize(s.totalSize)} · 爬取于 ${new Date(info.crawledAt ?? Date.now()).toLocaleString('zh-CN')}`;
 
   for (const s of await window.fz.dlList()) dl.set(s.fid, s);
@@ -1528,7 +1550,8 @@ $('btn-cookie').addEventListener('click', () => void cookieModal());
 // 识别入口暂时停用：index.html 里 #btn-ocr 已被注释掉，这里也不挂监听，
 // 否则 $() 取到 null 会让整个渲染层在启动时报错。
 if (OCR_RECOGNITION_ENABLED) $('btn-ocr').addEventListener('click', () => void ocrModal());
-$('btn-textindex').addEventListener('click', () => void textIndexModal());
+// 全文索引面板同样按开关挂载：index.html 里 #btn-textindex 已注释，$() 会取到 null
+if (FULLTEXT_ENABLED) $('btn-textindex').addEventListener('click', () => void textIndexModal());
 $('btn-lib').addEventListener('click', () => void libraryModal());
 $('btn-dl').addEventListener('click', async () => {
   const tray = $('dltray');

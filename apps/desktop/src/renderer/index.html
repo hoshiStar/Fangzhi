@@ -29,7 +29,8 @@
           <button id="btn-cookie" class="ghost">账号与登录</button>
           <!-- 识别率暂时不达标，全文识别入口停用；恢复时连同 app.ts 与 main/index.ts 的 OCR_RECOGNITION_ENABLED 一起放出来 -->
           <!-- <button id="btn-ocr" class="ghost">全文识别</button> -->
-          <button id="btn-textindex" class="ghost">全文索引</button>
+          <!-- 全文索引与全文检索一起冻结（本机 OCR 语料只有 60 页）；恢复时连同 FULLTEXT_ENABLED 一起放出来 -->
+          <!-- <button id="btn-textindex" class="ghost">全文索引</button> -->
           <button id="btn-lib" class="ghost">书签与最近阅读</button>
           <button id="btn-crawl" class="ghost">更新索引</button>
           <button id="btn-dir" class="ghost">数据目录</button>
@@ -84,7 +85,8 @@
       <input id="r-q" class="rq hidden" placeholder="书内搜索，回车下一处" />
       <span id="r-hits" class="tag hidden"></span>
       <button id="r-pdf" class="on" title="看原 PDF 版面">PDF 原文</button>
-      <!-- 识别入口停用，阅读器的「OCR 文本」按钮一并摘掉；文本视图本身保留，全文命中仍可跳进去 -->
+      <!-- 识别入口停用，阅读器的「OCR 文本」按钮一并摘掉；全文检索也冻结了，
+           文本视图只剩代码没有入口，恢复时连同 FULLTEXT_ENABLED 一起放开 -->
       <!-- <button id="r-ocr" title="看 OCR 识别出的文字（还没识别时不可用）" disabled>OCR 文本</button> -->
       <button id="r-fit" title="在「适应宽度」和「实际大小」之间切换">适应宽度</button>
       <button id="r-mark" title="收藏当前页（再点一次取消）">☆ 书签</button>

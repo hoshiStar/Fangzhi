@@ -76,12 +76,28 @@ let settings: { downloadDir: string; dataDir?: string; autoTextIndex?: boolean }
  * （见 renderer/app.ts 的同名开关与 index.html 里注释掉的 #btn-ocr），IPC 一律
  * 回「已停用」，连运行时探测都不做，不会拉子进程。
  *
- * 注意只停「识别」：阅读器的「OCR 文本」视图、全文检索、倒排索引与自动同步都
- * 照常工作，已有的 data/ocr 与 .text-index 原样可用，不是把 OCR 相关一律摘掉。
+ * 注意只停「识别」；消费侧（全文检索、倒排索引）另由下面的 FULLTEXT_ENABLED 控制。
  * 恢复时把这里和 src/renderer/app.ts 的 OCR_RECOGNITION_ENABLED 一起改回 true。
  */
 const OCR_RECOGNITION_ENABLED = false;
 const OCR_DISABLED_NOTE = '识别功能暂时停用（当前识别率不达标）';
+
+/**
+ * 全文检索与倒排索引总开关（暂时停用）。
+ *
+ * 2026-11 起连「消费端」一起冻结：本机 OCR 语料实际只有 10 个文件 × 6 页 = 60 页，
+ * 而书库有 4600 个文件，全文覆盖 0.2%——搜出来的东西几乎不可能是要找的那一本，
+ * 却要每次启动都 stat 一遍、每轮检索都读 jsonl，界面还占一块「全文命中」。
+ *
+ * 关掉之后：不读 data/ocr、不读 .text-index / .text-cache、不做启动同步、
+ * 打包也不带这几份数据；界面隐藏全文命中块、全文索引面板与阅读器的 OCR 文本视图。
+ * 书目检索（书名/地名/志种/著者/文件名）完全不受影响。
+ *
+ * 代码一行没删：恢复时把这个常量改回 true，再把 index.html 里注释掉的
+ * #btn-textindex 与 #r-ocr 放开即可，索引与语料仍在仓库 data/ 下。
+ */
+const FULLTEXT_ENABLED = false;
+const FULLTEXT_DISABLED_NOTE = '全文检索暂时停用（本机 OCR 语料不足，书名检索不受影响）';
 
 /** 停用时给界面的假状态：形状与 OcrJobState 一致，避免调用方解构出错。 */
 function ocrDisabledStatus() {
@@ -270,6 +286,8 @@ function dataDirWritable(): boolean {
 let ocrRunning = false;
 
 function scheduleTextIndexSync(reason: string, delayMs = 3000): void {
+  // 全库冻结期间连 stat 预检都不做：启动时省一次全库扫描，也不会误建索引
+  if (!FULLTEXT_ENABLED) return;
   if (settings.autoTextIndex === false) return;
   if (indexSyncTimer) clearTimeout(indexSyncTimer);
   indexSyncTimer = setTimeout(() => {
@@ -540,14 +558,41 @@ function registerIpc(): void {
     return { ok: true, mode: 'online', size: rec.size, url };
   });
 
-  /** OCR 文本：控制面拿目录信息，数据面按页取，正文不进渲染进程内存一次到底。 */
-  ipcMain.handle('ocr-info', (_e, fid: string) => ocr.info(fid));
-  ipcMain.handle('ocr-page', (_e, fid: string, p: number, q?: string) => ocr.page(fid, p, q));
-  ipcMain.handle('ocr-search', (_e, fid: string, q: string) => ocr.search(fid, q));
+  /**
+   * OCR 文本：控制面拿目录信息，数据面按页取，正文不进渲染进程内存一次到底。
+   * FULLTEXT_ENABLED 为 false 时一律当作「没有文本」：不读 data/ocr，也不碰缓存。
+   */
+  ipcMain.handle('ocr-info', (_e, fid: string) => (
+    FULLTEXT_ENABLED ? ocr.info(fid) : { ok: false as const, error: FULLTEXT_DISABLED_NOTE }
+  ));
+  ipcMain.handle('ocr-page', (_e, fid: string, p: number, q?: string) => (
+    FULLTEXT_ENABLED ? ocr.page(fid, p, q) : null
+  ));
+  ipcMain.handle('ocr-search', (_e, fid: string, q: string) => (
+    FULLTEXT_ENABLED ? ocr.search(fid, q) : { hits: [] as Array<{ p: number; n: number }>, total: 0 }
+  ));
   // 全库全文检索走独立线程；同一时间只跑一条，新查询顶掉旧查询。
-  ipcMain.handle('search-text', (_e, q: string) => fulltext.search(q));
+  ipcMain.handle('search-text', (_e, q: string) => (
+    FULLTEXT_ENABLED
+      ? fulltext.search(q)
+      : { total: 0, books: [], disabled: true, reason: FULLTEXT_DISABLED_NOTE }
+  ));
   /** 倒排索引：状态用于界面展示，重建放线程里跑并推进度。 */
   ipcMain.handle('text-index-status', () => {
+    if (!FULLTEXT_ENABLED) {
+      return {
+        built: false,
+        meta: null,
+        stale: [] as string[],
+        textFiles: 0,
+        auto: false,
+        syncing: false,
+        lastSync: null,
+        bytes: 0,
+        disabled: true,
+        reason: FULLTEXT_DISABLED_NOTE,
+      };
+    }
     const i = loadTextIndex(dataDir);
     return {
       built: !!i,
@@ -566,9 +611,14 @@ function registerIpc(): void {
       })(),
     };
   });
-  ipcMain.handle('text-index-build', () => textIndexBuilder.build());
+  ipcMain.handle('text-index-build', () => (
+    FULLTEXT_ENABLED
+      ? textIndexBuilder.build()
+      : { ok: false as const, disabled: true, error: FULLTEXT_DISABLED_NOTE }
+  ));
   /** 自动同步开关：关掉就不再跟着识别更新，只能手动重建。 */
   ipcMain.handle('text-index-set-auto', (_e, on: boolean) => {
+    if (!FULLTEXT_ENABLED) return { auto: false, disabled: true };
     settings.autoTextIndex = !!on;
     saveSettings();
     if (settings.autoTextIndex) scheduleTextIndexSync('toggle', 800);
@@ -576,6 +626,7 @@ function registerIpc(): void {
   });
   /** 手动触发一次增量，给界面上「立即同步」用。 */
   ipcMain.handle('text-index-sync', () => {
+    if (!FULLTEXT_ENABLED) return { ok: true as const, changed: false, disabled: true };
     if (indexSyncTimer) {
       clearTimeout(indexSyncTimer);
       indexSyncTimer = null;
@@ -583,6 +634,10 @@ function registerIpc(): void {
     return runTextIndexSync('manual');
   });
   ipcMain.handle('ocr-summary', () => {
+    // 冻结期间不报覆盖数：界面上那几处统计已经隐藏，给零值避免误导成「0 本已识别」
+    if (!FULLTEXT_ENABLED) {
+      return { totalFiles: 0, textFiles: 0, doneFiles: 0, doneBooks: 0, totalBooks: 0, disabled: true };
+    }
     const files = idx?.files ?? [];
     return {
       totalFiles: files.length,

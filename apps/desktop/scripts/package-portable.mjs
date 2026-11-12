@@ -40,24 +40,33 @@ writeFileSync(join(app, 'package.json'), JSON.stringify({
 }, null, 2) + '\n');
 cpSync(join(desktop, 'dist'), join(app, 'dist'), { recursive: true });
 
+// 全文数据是否随包发（与 apps/desktop/src/main/index.ts 的 FULLTEXT_ENABLED 保持一致）。
+// 冻结期间不带 data/ocr、.text-index、.text-cache：运行时根本不读它们，
+// 白占体积还要多校验一遍时间戳；索引里的 textRef 字段仍然保留，
+// 恢复时把这个常量改回 true 重新打包即可。
+const FULLTEXT_ENABLED = false;
+
 const data = join(out, 'resources', 'data');
 mkdirSync(data, { recursive: true });
 cpSync(src, join(data, 'index.full.json'));
 const meta = join(repo, 'data', 'meta.json');
 if (existsSync(meta)) cpSync(meta, join(data, 'meta.json'));
-// OCR 文本目录（tools/ocr/ocr.py 的产出），没有就不拷，阅读器会自己降级成只读 PDF
-// OCR 文本与倒排索引都按 (源文件 mtime) 判有效期，拷贝必须保留时间戳，
-// 否则包内索引一装就全部判过期，等于白带。
-const ocrDir = join(repo, 'data', 'ocr');
-if (existsSync(ocrDir)) cpSync(ocrDir, join(data, 'ocr'), { recursive: true, preserveTimestamps: true });
-// 倒排索引随包发：打包版数据目录通常不可写，运行时没法自己重建
-const textIndex = join(repo, 'data', '.text-index');
-if (existsSync(textIndex)) cpSync(textIndex, join(data, '.text-index'), { recursive: true, preserveTimestamps: true });
-// 检索缓存同理：跟 OCR 一起带走，首次检索不用重新解析
-const textCache = join(repo, 'data', '.text-cache');
-if (existsSync(textCache)) cpSync(textCache, join(data, '.text-cache'), { recursive: true, preserveTimestamps: true });
+if (FULLTEXT_ENABLED) {
+  // OCR 文本目录（tools/ocr/ocr.py 的产出），没有就不拷，阅读器会自己降级成只读 PDF
+  // OCR 文本与倒排索引都按 (源文件 mtime) 判有效期，拷贝必须保留时间戳，
+  // 否则包内索引一装就全部判过期，等于白带。
+  const ocrDir = join(repo, 'data', 'ocr');
+  if (existsSync(ocrDir)) cpSync(ocrDir, join(data, 'ocr'), { recursive: true, preserveTimestamps: true });
+  // 倒排索引随包发：打包版数据目录通常不可写，运行时没法自己重建
+  const textIndex = join(repo, 'data', '.text-index');
+  if (existsSync(textIndex)) cpSync(textIndex, join(data, '.text-index'), { recursive: true, preserveTimestamps: true });
+  // 检索缓存同理：跟 OCR 一起带走，首次检索不用重新解析
+  const textCache = join(repo, 'data', '.text-cache');
+  if (existsSync(textCache)) cpSync(textCache, join(data, '.text-cache'), { recursive: true, preserveTimestamps: true });
+}
 
-// 识别脚本随包发：桌面端「全文识别」要能直接拉起子进程。
+// 识别脚本随包发：桌面端「全文识别」要能直接拉起子进程（识别暂停时也用不上，
+// 但只有二十来 KB，留着省得恢复时还要重新打包）。
 // 模型（tools/ocr/models）几十 MB 且首次使用才下载，不打进包里。
 const ocrScript = join(repo, 'tools', 'ocr', 'ocr.py');
 if (existsSync(ocrScript)) {
@@ -77,14 +86,17 @@ function walkFiles(dir) {
 
 const indexBytes = readFileSync(src);
 const idx = JSON.parse(indexBytes.toString('utf8'));
-const missingOcr = (idx.files ?? [])
-  .filter((f) => f.textRef && !existsSync(join(data, String(f.textRef))))
-  .map((f) => f.textRef);
+/** 只有随包发 OCR 数据时才核对覆盖率，否则索引里残留的 textRef 会被当成「缺文件」。 */
+const missingOcr = FULLTEXT_ENABLED
+  ? (idx.files ?? [])
+    .filter((f) => f.textRef && !existsSync(join(data, String(f.textRef))))
+    .map((f) => f.textRef)
+  : [];
 if (missingOcr.length) {
   console.error(`发布中止：索引引用了 ${missingOcr.length} 个缺失的 OCR 文件，例如 ${missingOcr[0]}`);
   process.exit(1);
 }
-const ocrFiles = walkFiles(join(data, 'ocr'));
+const ocrFiles = FULLTEXT_ENABLED ? walkFiles(join(data, 'ocr')) : [];
 const manifest = {
   generatedAt: new Date().toISOString(),
   appVersion: pkg.version,
@@ -97,7 +109,9 @@ const manifest = {
     totalSize: idx.stats?.totalSize ?? 0,
     ocrRefs: (idx.files ?? []).filter((f) => f.textRef).length,
   },
+  // packed=false 表示这一版没有随包带全文数据（全文检索与索引在运行时被冻结）
   ocr: {
+    packed: FULLTEXT_ENABLED,
     files: ocrFiles.length,
     bytes: ocrFiles.reduce((n, p) => n + statSync(p).size, 0),
   },

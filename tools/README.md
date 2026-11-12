@@ -18,8 +18,10 @@
 ## 会访问真实网络
 
 - `verify-crawl-resume.ts`：真实爬取夸克分享，必须显式加 `--run`。
-- `tools/cdp-probe.mjs`：默认只读界面检查；账号与下载写操作需要 `FZ_CDP_ALLOW_COOKIE_MUTATION=1`，通过界面重建全文索引需要 `FZ_CDP_BUILD_INDEX=1`，且都只能在独立 `FZ_USER_DATA_DIR` 下运行。全文识别入口暂时停用，探针改为断言「入口已隐藏 + IPC 回停用」；`FZ_CDP_RUN_OCR=1` 暂时被忽略（恢复识别后原步骤在注释里）。
+- `tools/cdp-probe.mjs`：默认只读界面检查；账号与下载写操作需要 `FZ_CDP_ALLOW_COOKIE_MUTATION=1`，通过界面重建全文索引需要 `FZ_CDP_BUILD_INDEX=1`（该路径目前随全文面板一起冻结），且都只能在独立 `FZ_USER_DATA_DIR` 下运行。识别入口与全文检索都已暂时停用，探针改为断言「入口已隐藏 + 接口回停用」；`FZ_CDP_RUN_OCR=1` 暂时被忽略，索引面板与全文检索的原断言、真跑识别的原步骤都留在注释里。
 
 ## OCR
 
 `tools/ocr/ocr.py` 需要 Python 3.12 和 uv，用法见仓库根目录 `README.md`。桌面端已内置执行器，日常不需要命令行。
+
+> 识别与全文检索自 2026-11 起暂时停用（本机语料只有 60 页），下面的脚本与 `build-text-index.ts` 仍可手工运行，产出会写进 `data/`，但应用当前不读它们。恢复方式见根目录 `README.md` 的「OCR」一节。

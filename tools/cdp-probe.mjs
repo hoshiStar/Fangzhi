@@ -190,34 +190,36 @@ await check('无结果提示', `document.querySelector('.empty')?.textContent`, 
 await check('无结果时收起旧详情', `document.getElementById('detail').classList.contains('hidden')`, (v) => v === true);
 
 // 全文识别入口已停用（识别率暂时不达标）：按钮不渲染，IPC 一律回「已停用」。
-// 只停识别——下面的全文索引面板与全文检索仍应正常，恢复识别时把这里改回弹层断言。
 await check('全文识别入口已隐藏', `!!document.getElementById('btn-ocr')`, (v) => v === false);
 await check('详情页识别按钮已隐藏', `!!document.getElementById('d-ocr')`, (v) => v === false);
 await check('识别启动被拒', `window.fz.ocrRunnerStart({})`, (v) => v?.ok === false && /停用/.test(v.error ?? ''));
 await check('识别状态标记停用', `window.fz.ocrRunnerStatus()`, (v) => v?.disabled === true);
 
-// 全文索引面板（只读状态；重建索引会写数据目录，留给手工或 FZ_CDP_BUILD_INDEX）
-await evaluate(ws, `document.getElementById('btn-textindex').click()`);
-await waitFor(`!!document.getElementById('ti-build')`);
-await check('全文索引面板已打开', `document.getElementById('modal-card').textContent`, (v) => /倒排索引/.test(v));
-await check('全文索引状态可见', `document.getElementById('ti-state').textContent`,
-  (v) => /已建/.test(v) || /还没有倒排索引/.test(v));
-await check('全文索引待重建按钮', `!!document.getElementById('ti-build')`, (v) => v === true);
-// 自动同步：默认开着，识别完成/启动/换目录时自动跑增量
-await check('自动同步默认开启', `document.getElementById('ti-auto')?.checked`, (v) => v === true);
-await check('自动同步说明可见', `document.getElementById('ti-sync')?.textContent`, (v) => /自动同步|最近同步/.test(v));
-await check('增量同步按钮就绪', `!!document.getElementById('ti-sync-now')`, (v) => v === true);
-if (process.env.FZ_CDP_BUILD_INDEX === '1') {
-  await evaluate(ws, `document.getElementById('ti-build').click()`);
-  await waitFor(`/完成：|失败|没有/.test(document.getElementById('ti-msg')?.textContent ?? '')`, 180000);
-  await check('全文索引重建完成', `document.getElementById('ti-msg')?.textContent`, (v) => /完成：/.test(v));
-  // 刚建完，紧接着的增量同步应当判定「没有变化」，一个字节都不写
-  await evaluate(ws, `document.getElementById('ti-sync-now').click()`);
-  await waitFor(`/已经是最新|同步完成|失败/.test(document.getElementById('ti-msg')?.textContent ?? '')`, 60000);
-  await check('全量重建后增量同步判定无变化', `document.getElementById('ti-msg')?.textContent`, (v) => /已经是最新/.test(v));
-}
-await evaluate(ws, `document.getElementById('ti-close').click()`);
-await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
+// 全文检索与倒排索引一起冻结（本机 OCR 语料只有 60 页，见 FULLTEXT_ENABLED）：
+// 工具菜单入口不渲染、状态接口回停用、重建被拒、OCR 文本接口当作「没有文本」。
+// 恢复时把这段换回原来的面板断言（已注释保留在下面）。
+await check('全文索引入口已隐藏', `!!document.getElementById('btn-textindex')`, (v) => v === false);
+await check('全文索引状态标记停用', `window.fz.textIndexStatus()`, (v) => v?.disabled === true && v?.built === false);
+await check('全文索引重建被拒', `window.fz.buildTextIndex()`, (v) => v?.disabled === true);
+await check('OCR 文本接口标记停用', `window.fz.ocrInfo('x')`, (v) => v?.ok === false && /停用/.test(v.error ?? ''));
+await check('状态栏不再报全文覆盖', `document.getElementById('status-right').textContent`, (v) => !/全文/.test(v));
+// 原来的面板断言：恢复 FULLTEXT_ENABLED 后放回来
+// await evaluate(ws, `document.getElementById('btn-textindex').click()`);
+// await waitFor(`!!document.getElementById('ti-build')`);
+// await check('全文索引面板已打开', `document.getElementById('modal-card').textContent`, (v) => /倒排索引/.test(v));
+// await check('全文索引状态可见', `document.getElementById('ti-state').textContent`,
+//   (v) => /已建/.test(v) || /还没有倒排索引/.test(v));
+// await check('自动同步默认开启', `document.getElementById('ti-auto')?.checked`, (v) => v === true);
+// if (process.env.FZ_CDP_BUILD_INDEX === '1') {
+//   await evaluate(ws, `document.getElementById('ti-build').click()`);
+//   await waitFor(`/完成：|失败|没有/.test(document.getElementById('ti-msg')?.textContent ?? '')`, 180000);
+//   await check('全文索引重建完成', `document.getElementById('ti-msg')?.textContent`, (v) => /完成：/.test(v));
+//   await evaluate(ws, `document.getElementById('ti-sync-now').click()`);
+//   await waitFor(`/已经是最新|同步完成|失败/.test(document.getElementById('ti-msg')?.textContent ?? '')`, 60000);
+//   await check('全量重建后增量同步判定无变化', `document.getElementById('ti-msg')?.textContent`, (v) => /已经是最新/.test(v));
+// }
+// await evaluate(ws, `document.getElementById('ti-close').click()`);
+// await waitFor(`document.getElementById('modal').classList.contains('hidden')`);
 
 // 书签与最近阅读面板
 await evaluate(ws, `document.getElementById('btn-lib').click()`);
@@ -263,6 +265,9 @@ if (process.env.FZ_CDP_SKIP_READER !== '1') {
     await check('阅读器画布已渲染', `!document.getElementById('r-canvas').classList.contains('hidden')`, (v) => v === true);
     await check('阅读器书签按钮初始未选中', `document.getElementById('r-mark').textContent`, (v) => /书签/.test(v) && !/已收藏/.test(v));
     await check('阅读器 OCR 文本按钮已隐藏', `!!document.getElementById('r-ocr')`, (v) => v === false);
+    // 全文冻结后 ocrInfo 一律回「没有文本」，书内搜索框与 OCR 页数标注都不应出现
+    await check('书内搜索框也隐藏', `document.getElementById('r-q').classList.contains('hidden')`, (v) => v === true);
+    await check('阅读器不标 OCR 页数', `document.getElementById('r-mode').textContent`, (v) => !/OCR/.test(v));
     await evaluate(ws, `document.getElementById('r-mark').click()`);
     await waitFor(`/已收藏/.test(document.getElementById('r-mark').textContent)`, 8000);
     await check('点书签后变为已收藏', `document.getElementById('r-mark').textContent`, (v) => /已收藏/.test(v));
@@ -330,19 +335,23 @@ await check('爬取弹层出现', `!document.getElementById('crawlbar').classLis
 await check('爬取链接预填', `document.getElementById('c-url').value`, (v) => v === 'https://pan.quark.cn/s/2d5c2ddfe25b');
 await evaluate(ws, `document.getElementById('c-close')?.click()`);
 
-// 全库全文检索：查一个只出现在 OCR 正文、不在书名里的词，验证 worker 线程链路真的通了。
-// 这类查询的书名结果是空的，摘要不会回显查询词，所以只等正文结果块，不等摘要。
-// 先把上一轮的全文块清掉：否则「等结果块出现」会立刻被旧内容满足，读到过期命中。
-await evaluate(ws, `(()=>{const b=document.getElementById('textlist');b.classList.add('hidden');b.innerHTML='';})()`);
+// 全库全文检索已冻结（FULLTEXT_ENABLED = false）：查询只走书目，正文块不再出现。
+// 恢复后把下面注释掉的链路断言放回来（原来查的是只出现在 OCR 正文里的「成文出版社」）。
 await typeQuery('成文出版社');
-const textHit = await waitFor(`/全文命中|全文没有命中/.test(document.getElementById('textlist').textContent)`, 25000);
-await check('全文检索返回结果块', textHit, (v) => v === true);
-await check('全文命中计数', `document.getElementById('textlist').textContent`, (v) => /全文命中\s*\d+\s*处/.test(v));
-await check('全文命中行可跳页', `document.querySelectorAll('#textlist .thit').length`, (v) => v >= 1);
-// worker 起不来会退回主进程同步扫描，界面会卡；这条保证没走兜底
-await check('全文检索未退化为同步模式', `document.getElementById('textlist').textContent`, (v) => !/兼容模式/.test(v));
+await sleep(800);
+await check('全文命中块已隐藏', `document.getElementById('textlist').classList.contains('hidden')`, (v) => v === true);
+await check('全文检索 IPC 回停用', `window.fz.searchText('成文出版社')`, (v) => v?.disabled === true && v?.total === 0);
 await typeQuery('', '浏览全部');
 await waitFor(`document.querySelectorAll('.book').length === 50`, 15000);
+// await evaluate(ws, `(()=>{const b=document.getElementById('textlist');b.classList.add('hidden');b.innerHTML='';})()`);
+// await typeQuery('成文出版社');
+// const textHit = await waitFor(`/全文命中|全文没有命中/.test(document.getElementById('textlist').textContent)`, 25000);
+// await check('全文检索返回结果块', textHit, (v) => v === true);
+// await check('全文命中计数', `document.getElementById('textlist').textContent`, (v) => /全文命中\s*\d+\s*处/.test(v));
+// await check('全文命中行可跳页', `document.querySelectorAll('#textlist .thit').length`, (v) => v >= 1);
+// await check('全文检索未退化为同步模式', `document.getElementById('textlist').textContent`, (v) => !/兼容模式/.test(v));
+// await typeQuery('', '浏览全部');
+// await waitFor(`document.querySelectorAll('.book').length === 50`, 15000);
 
 // 下载与账号：会写/清 cookie，默认不在真实用户目录执行
 if (allowCookieMutation) {
